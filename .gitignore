@@ -1,0 +1,6 @@
+data/
+proj/
+*.pt
+*.pth
+*.npz
+*.pyc
