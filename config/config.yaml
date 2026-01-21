@@ -1,0 +1,69 @@
+# config/config.yaml
+
+# ================= 基础实验设置 =================
+experiment:
+  seed: 42
+  save_dir: "results"
+  device: "cuda"  # auto, cuda, or cpu
+
+# ================= 联邦学习参数 =================
+federated:
+  comm_rounds: 100
+  total_clients: 20
+  active_clients: 20
+  local_epochs: 5
+  batch_size: 64
+  lr: 0.01
+  
+# ================= 数据与模型 =================
+data:
+  dataset: "cifar10"  # mnist, cifar10
+  model: "cifar10"    # lenet5, cifar10
+  if_noniid: false
+  alpha: 0.5          # Non-IID 的狄利克雷分布参数
+
+# ================= 防御策略 =================
+defense:
+  method: "lsh_score_kickout" # none, lsh_score_kickout, only_score, only_kickout
+
+# ================= 攻击策略配置 =================
+attack:
+  poison_ratio: 0.2
+  # 启用的攻击类型列表 (可多选)
+  active_attacks: 
+    - "label_flip"
+  
+  # 具体攻击参数 (MESAS 对齐)
+  params:
+    random_poison:
+      noise_std: 0.5
+      
+    label_flip:
+      source_class: 5
+      target_class: 7
+      scale_update: true
+      scale_factor: 2.0
+      
+    backdoor:
+      backdoor_ratio: 0.1
+      backdoor_target: 0
+      trigger_size: 3
+      scale_update: true
+      scale_factor: 3.0
+      
+    model_compress:
+      compress_ratio: 0.95
+      
+    gradient_amplify:
+      amplify_factor: 5.0
+      
+    gradient_inversion:
+      inversion_strength: 1.0
+      
+    feature_poison:
+      poison_strength: 0.3
+      perturb_dim: 100
+      
+    batch_poison:
+      poison_ratio: 0.2
+      batch_noise_std: 0.1
