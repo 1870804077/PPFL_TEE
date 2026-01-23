@@ -9,12 +9,14 @@ from defence.layers_proj_detect import Layers_Proj_Detector
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Server:
-    def __init__(self, model, detection_method="lsh_score_kickout", seed=42, verbose=False):
+    def __init__(self, model, detection_method="lsh_score_kickout", defense_config=None, seed=42, verbose=False):
         self.global_model = model.to(DEVICE)
         self.superbit_lsh = SuperBitLSH(seed=seed)
         self.projection_matrix_path = None
         self.detection_method = detection_method
         self.verbose = verbose
+        
+        det_params = defense_config.get('params', {}) if defense_config else {}
         
         # 状态维护
         self.suspect_counters = {} 
@@ -24,7 +26,7 @@ class Server:
         self.detection_history = defaultdict(lambda: {'suspect_cnt': 0, 'kicked_cnt': 0, 'events': []})
         
         # 组件初始化
-        self.mesas_detector = Layers_Proj_Detector()
+        self.mesas_detector = Layers_Proj_Detector(config=det_params)
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
         self.current_round_weights = {}

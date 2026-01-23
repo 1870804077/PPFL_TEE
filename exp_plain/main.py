@@ -67,8 +67,9 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     server = Server(
         init_model, 
         detection_method=current_mode_config['defense_method'], 
+        defense_config=full_config['defense'],
         seed=full_config['experiment']['seed'],
-        verbose=verbose
+        verbose=verbose,
     )
     
     matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}.pt"

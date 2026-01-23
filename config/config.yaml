@@ -32,6 +32,28 @@ defense:
     - "conv1.weight"
     - "fc3.weight"
 
+defense:
+  method: "projected_mesas"
+  
+  target_layers: 
+    - "conv1.weight"
+    - "fc3.weight"
+    
+  params:
+    # DBSCAN 聚类参数
+    dbscan_eps: 0.5          # 邻域半径 (Non-IID 越严重，这个值要越大)
+    dbscan_min_samples: 3    # 最小核心点数
+    
+    # 统计筛除参数
+    l2_threshold_multiplier: 3.0  # L2范数阈值倍数 (Median + k * MAD)
+    var_threshold_multiplier: 3.0 # 方差阈值倍数
+    
+    # 评分参数
+    base_good_score: 10.0    # 良性基础分
+    suspect_score: 1.0       # 疑似者惩罚分
+    max_bonus: 10.0          # 最大奖励分
+    strike_threshold: 3      # 累计几次踢出
+
 # ================= 攻击策略配置 =================
 attack:
   poison_ratio: 0.2
