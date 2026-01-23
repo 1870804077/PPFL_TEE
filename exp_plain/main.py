@@ -29,6 +29,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     attack_conf = full_config['attack']
+    target_layers_config = full_config['defense'].get('target_layers', [])
     
     # --- 1. 结果存在性检查 ---
     exists, acc_history = check_result_exists(
@@ -119,9 +120,9 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             _ = client.local_train()
             
             # 投影 (Step 5) - 使用 LSH 的分批次计算避免 OOM
-            feature = client.generate_gradient_projection(start_idx=0)
+            feature_dict = client.generate_gradient_projection(target_layers=target_layers_config)
             
-            round_features.append(feature)
+            round_features.append(feature_dict)
             round_data_sizes.append(len(client.dataloader.dataset))
         
         # Phase 2: 检测 & 聚合

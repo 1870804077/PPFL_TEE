@@ -26,6 +26,9 @@ data:
 # ================= 防御策略 =================
 defense:
   method: "lsh_score_kickout" # none, lsh_score_kickout, only_score, only_kickout
+  target_layers: 
+    - "conv1.weight"
+    - "fc3.weight"
 
 # ================= 攻击策略配置 =================
 attack:
