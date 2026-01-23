@@ -4,7 +4,7 @@ from _utils_.LSH_proj_extra import SuperBitLSH
 from defence.score import ScoreCalculator
 from defence.kickout import KickoutManager
 # 引入新模块
-from defence.projected_mesas import ProjectedMesasDetector
+from defence.layers_proj_detect import Layers_Proj_Detector
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -20,7 +20,7 @@ class Server:
         self.global_update_direction = None # 上一轮的 Sum(Features)
         
         # 组件初始化
-        self.mesas_detector = ProjectedMesasDetector()
+        self.mesas_detector = Layers_Proj_Detector()
         # 保留原有组件以兼容旧逻辑(如果需要)
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
