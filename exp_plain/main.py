@@ -6,7 +6,7 @@ import yaml
 import argparse
 import sys
 import gc
-import time 
+import time
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -101,7 +101,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             a_params = attack_params_dict.get(a_type, {})
             poison_loader = PoisonLoader([a_type], a_params)
             
-            # 记录第一个攻击类型用于评估 ASR
             if primary_attack_type is None:
                 primary_attack_type = a_type
                 primary_attack_params = a_params
@@ -122,13 +121,12 @@ def run_single_mode(full_config, mode_name, current_mode_config):
 
     # 5. 训练循环
     accuracy_history = []
-    asr_history = [] # ASR 历史
+    asr_history = []
     total_rounds = fed_conf['comm_rounds']
     target_layers_config = full_config['defense'].get('target_layers', [])
     
     print(f"\n>>> 开始训练: {mode_name} | 恶意比例: {current_poison_ratio} | 防御: {current_mode_config['defense_method']}")
     
-    # 开始计时
     start_time = time.time()
     
     for r in range(1, total_rounds + 1):
@@ -149,7 +147,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             round_data_sizes.append(len(client.dataloader.dataset))
         
         # Phase 2: 检测 & 聚合
-        # 传入当前轮次以便日志记录
         weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes, current_round=r)
         
         for cid in active_ids:
@@ -183,7 +180,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    #  结束计时与总结报告
     end_time = time.time()
     total_time = end_time - start_time
     
@@ -195,15 +191,13 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     if asr_history:
         print(f"  最终 ASR   : {asr_history[-1]:.2f}%")
         
-    # 打印检测统计
     if server.detection_history:
         print("\n  [防御拦截统计]")
         print(f"  {'Client ID':<10} {'Suspect Count':<15} {'Kicked Count':<15} {'Details'}")
         print("  " + "-"*60)
         for cid, stats in sorted(server.detection_history.items()):
-            # 只打印有异常记录的
             if stats['suspect_cnt'] > 0 or stats['kicked_cnt'] > 0:
-                events_str = ",".join(stats['events'][-5:]) # 只显示最近5个事件
+                events_str = ",".join(stats['events'][-5:])
                 print(f"  {cid:<10} {stats['suspect_cnt']:<15} {stats['kicked_cnt']:<15} {events_str}...")
     print("="*50 + "\n")
 
@@ -224,12 +218,13 @@ def load_config(config_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='config/config.yaml')
+    parser.add_argument('--config', type=str, default='../config/config.yaml')
     parser.add_argument('--mode', type=str, default=None, help='指定只运行某个模式(逗号分隔)')
     args = parser.parse_args()
     
     config = load_config(args.config)
     
+    # [修改点] 补充 model_type 和 dataset_type，确保绘图时能匹配到文件
     base_flat_config = {
         'total_clients': config['federated']['total_clients'],
         'batch_size': config['federated']['batch_size'],
@@ -237,7 +232,9 @@ def main():
         'if_noniid': config['data']['if_noniid'],
         'alpha': config['data']['alpha'],
         'attack_types': config['attack']['active_attacks'],
-        'seed': config['experiment']['seed']
+        'seed': config['experiment']['seed'],
+        'model_type': config['data']['model'],      # 新增
+        'dataset_type': config['data']['dataset']   # 新增
     }
     
     default_poison_ratio = config['attack']['poison_ratio']
