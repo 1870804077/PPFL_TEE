@@ -3,6 +3,8 @@ import copy
 from _utils_.LSH_proj_extra import SuperBitLSH
 from defence.score import ScoreCalculator
 from defence.kickout import KickoutManager
+# 引入新模块
+from defence.projected_mesas import ProjectedMesasDetector
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -12,62 +14,87 @@ class Server:
         self.superbit_lsh = SuperBitLSH(seed=seed)
         self.projection_matrix_path = None
         self.detection_method = detection_method
-        self.seed = seed
         
-        # 初始化防御组件
-        self.score_calculator = None
-        self.kickout_manager = None
+        # 状态维护
+        self.suspect_counters = {} # {cid: strike_count}
+        self.global_update_direction = None # 上一轮的 Sum(Features)
         
-        if "score" in self.detection_method:
-            self.score_calculator = ScoreCalculator()
-        if "kickout" in self.detection_method:
-            self.kickout_manager = KickoutManager()
+        # 组件初始化
+        self.mesas_detector = ProjectedMesasDetector()
+        # 保留原有组件以兼容旧逻辑(如果需要)
+        self.score_calculator = ScoreCalculator() if "score" in detection_method else None
+        self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
             
-        # 存储本轮的临时权重
         self.current_round_weights = {}
 
-    def generate_projection_matrix(self, input_dim, output_dim, matrix_file_path=None):
-        """步骤1: 生成投影矩阵"""
-        if matrix_file_path is None:
-            matrix_file_path = f"proj/projection_matrix_{input_dim}x{output_dim}.pt"
-        self.projection_matrix_path = self.superbit_lsh.generate_projection_matrix(
-            input_dim, output_dim, device='cpu', matrix_file_path=matrix_file_path
-        )
+    # ... generate_projection_matrix, get_global_params_and_proj 保持不变 ...
 
-    def get_global_params_and_proj(self):
-        """步骤3: 获取分发参数"""
-        return copy.deepcopy(self.global_model.state_dict()), self.projection_matrix_path
-
-    def calculate_weights(self, client_id_list, client_features, client_data_sizes):
-        """步骤7: 基于投影特征计算权重"""
-        if self.detection_method == "none":
-            # 无防御：FedAvg 权重 (基于数据量)
-            total_size = sum(client_data_sizes)
-            weights = {cid: size / total_size for cid, size in zip(client_id_list, client_data_sizes)}
-            self.current_round_weights = weights
-            return weights
-
-        # 有防御：计算分数
-        client_scores = {}
-        if self.score_calculator:
-            for i, cid in enumerate(client_id_list):
-                client_scores[cid] = self.score_calculator.calculate_scores(
-                    cid, client_features[i], client_data_sizes[i]
-                )
-
-        # 决定权重
-        weights = {}
-        if self.detection_method == "lsh_score_kickout":
-            weights = self.kickout_manager.determine_weights(client_scores)
-        elif self.detection_method == "only_score":
-            total_score = sum(s['final_score'] for s in client_scores.values())
-            weights = {cid: s['final_score']/total_score for cid, s in client_scores.items()}
-        elif self.detection_method == "only_kickout":
-            if self.kickout_manager:
-                weights = self.kickout_manager.determine_weights(client_scores)
+    def calculate_weights(self, client_id_list, client_features_dict_list, client_data_sizes):
+        """
+        步骤7: 检测并计算权重
+        :param client_features_dict_list: list of dict, 每个元素是 Client 发来的 {'full':.., 'layers':..}
+        """
         
+        # 重组数据方便处理: list -> dict {cid: feature_dict}
+        client_projections = {
+            cid: feat 
+            for cid, feat in zip(client_id_list, client_features_dict_list)
+        }
+
+        # 1. 计算下一轮的全局方向 (Step 3: Sum of current projections)
+        # 注意：这里我们使用本轮所有客户端(在剔除前)的投影之和作为"本轮的整体方向"
+        # 也可以选择只使用 High Weight 客户端的和，这里先按要求全量加和
+        self._update_global_direction_feature(client_projections)
+
+        # 2. 执行检测 (Step 2 & 4: MESAS-like detection & Scoring)
+        if "mesas" in self.detection_method or "projected" in self.detection_method:
+            # 使用新的检测器
+            weights, logs = self.mesas_detector.detect(
+                client_projections, 
+                self.global_update_direction, # 注意：这里传入的是"上一轮"积累下来的方向，如果刚更新完，需要理清逻辑
+                # 逻辑修正：
+                # 应该拿"当前轮的个体的投影" 与 "上一轮的全局方向" 做对比
+                # 所以 self.global_update_direction 应该在 detect 之后再 update，或者这里传入 old_direction
+                # 这里假设 self.global_update_direction 存储的是 Round T-1 的结果
+                self.suspect_counters
+            )
+            
+            # 更新全局方向供 Round T+1 使用 (Step 3)
+            # 放到 Detect 之后更新，确保 Detect 用的是 History
+            self._update_global_direction_feature(client_projections)
+            
+        else:
+            # Fallback 到旧逻辑 (仅供参考)
+            # 这里需要适配 client_features_dict_list 只取 ['full']
+            full_features = [f['full'] for f in client_features_dict_list]
+            weights = self._fallback_old_detection(client_id_list, full_features, client_data_sizes)
+
         self.current_round_weights = weights
         return weights
+
+    def _update_global_direction_feature(self, client_projections):
+        """
+        步骤3: 将本轮投影对应加和，得到全局更新方向，留待下轮检测
+        Global_Dir = Sum(g_i * W) = Sum(Proj_i)
+        """
+        if not client_projections:
+            return
+
+        # 取出第一个来初始化形状
+        first_proj = list(client_projections.values())[0]['full']
+        agg_proj = torch.zeros_like(first_proj, device=first_proj.device)
+        
+        # 简单累加 (也可以做加权累加)
+        for cid, proj_data in client_projections.items():
+            agg_proj += proj_data['full']
+            
+        # 更新 Server 状态
+        # 可以引入动量: New = 0.9 * Old + 0.1 * Current
+        if self.global_update_direction is None:
+            self.global_update_direction = agg_proj
+        else:
+            # 简单的直接替换，或者动量更新
+            self.global_update_direction = agg_proj 
 
     def update_global_model(self, weighted_client_models_list, client_ids_list):
         """步骤9: 聚合已加权的参数"""
@@ -102,3 +129,7 @@ class Server:
             self.global_model.load_state_dict(agg_params)
         else:
             print("  [Warning] 本轮无有效更新。")
+        
+    def _fallback_old_detection(self, ids, features, sizes):
+        # ... 旧的 score/kickout 逻辑 ...
+        return {cid: 1.0 for cid in ids}

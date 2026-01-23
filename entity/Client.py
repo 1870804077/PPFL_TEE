@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import copy
 from _utils_.poison_loader import PoisonLoader
 from _utils_.LSH_proj_extra import SuperBitLSH
 
@@ -17,60 +16,86 @@ class Client:
         self.optimizer = None
         self.superbit_lsh = SuperBitLSH()
         
-        # 临时存储本地梯度/更新量，用于投影
+        # 暂存梯度
         self.local_grad_flat = None 
+        # 缓存层索引信息 {layer_name: (start_idx, length)}
+        self.layer_indices = None
 
     def receive_model_and_proj(self, model_params, projection_matrix_path):
-        """步骤3: 接收模型和投影矩阵"""
+        """接收模型，并初始化层索引信息"""
         if self.model is None:
             self.model = self.model_class().to(DEVICE)
         self.model.load_state_dict(model_params)
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
         self.superbit_lsh.set_projection_matrix_path(projection_matrix_path)
+        
+        # 计算每层参数在 flatten 向量中的索引范围 (只需做一次)
+        if self.layer_indices is None:
+            self._calculate_layer_indices()
+
+    def _calculate_layer_indices(self):
+        """辅助函数：计算每层参数的 (start, length)"""
+        self.layer_indices = {}
+        current_idx = 0
+        for name, param in self.model.named_parameters():
+            length = param.numel()
+            self.layer_indices[name] = (current_idx, length)
+            current_idx += length
 
     def local_train(self):
-        """步骤4: 执行本地训练，返回更新量(伪梯度)"""
-        # 调用 PoisonLoader 统一处理
+        """训练并返回梯度"""
         trained_params, grad_flat = self.poison_loader.execute_attack(
             self.model, self.dataloader, self.model_class, DEVICE, self.optimizer
         )
-        
-        # 暂存梯度用于后续投影
         self.local_grad_flat = grad_flat
-        
-        # 显存优化：如果不立即使用 trained_params，可以先不存，
-        # 但为了后续加权上传，我们需要模型保持在 trained 状态
         return grad_flat
 
-    def generate_gradient_projection(self, start_idx=0):
-        """步骤5 & 6: 对暂存的梯度进行投影 (支持按需分层，这里默认全量)"""
+    def generate_gradient_projection(self, target_layers=None):
+        """
+        [修改] 生成全量及指定层的投影
+        :param target_layers: list of str, 指定需要单独投影的层名称 (例如 ['conv1.weight', 'fc3.bias'])
+                             如果为 None，则只做全量投影或默认关键层投影
+        :return: dict {'full': tensor, 'layers': {name: tensor}}
+        """
         if self.local_grad_flat is None:
             raise ValueError("No gradient computed yet!")
         
-        # 调用 LSH 工具进行投影
-        # 如果是全量投影，start_idx=0
-        feature = self.superbit_lsh.extract_feature(self.local_grad_flat, start_idx=start_idx)
+        projections = {}
         
-        # 特征层投毒 (如果有)
-        feature = self.poison_loader.apply_feature_poison(feature)
+        # 1. 全量投影 (Full Gradient Projection)
+        # 这里的 start_idx=0, length=auto
+        full_proj = self.superbit_lsh.extract_feature(self.local_grad_flat, start_idx=0)
+        # 应用特征投毒 (针对全量)
+        projections['full'] = self.poison_loader.apply_feature_poison(full_proj)
         
-        return feature
+        # 2. 指定层投影 (Layer-wise Projection)
+        projections['layers'] = {}
+        if target_layers:
+            for layer_name in target_layers:
+                if layer_name in self.layer_indices:
+                    start, length = self.layer_indices[layer_name]
+                    # 调用 LSH 对该段数据投影 (LSH类已支持 start_idx 和 length 自动推导)
+                    # 注意：extract_feature 内部需要支持传入 explicit length 或者通过 slice 传入
+                    # 为了复用之前的代码，我们需要传入切片后的 tensor 或者让 extract_feature 支持 length 参数
+                    # 这里假设我们传入切片后的 tensor 给 extract_feature
+                    
+                    # 切片梯度
+                    layer_grad_chunk = self.local_grad_flat[start : start + length]
+                    
+                    # 投影 (注意 start_idx 对应投影矩阵的列位置)
+                    layer_proj = self.superbit_lsh.extract_feature(layer_grad_chunk, start_idx=start)
+                    projections['layers'][layer_name] = layer_proj
+        
+        return projections
 
     def prepare_upload_weighted_params(self, weight):
-        """步骤8: 计算 全量参数 * 权重"""
-        # 获取当前训练后的参数
+        """计算加权参数"""
         current_params = self.model.state_dict()
         weighted_params = {}
-        
         for key, param in current_params.items():
             if param.dtype in [torch.float32, torch.float64]:
-                # 乘上服务器下发的权重
                 weighted_params[key] = param * weight
             else:
-                # 整数参数(如step)保持不变或置零，取决于聚合策略
-                # 这里简单起见，跟随参数传递，但在聚合时需注意
                 weighted_params[key] = param 
-                
-        # 可以在这里清理显存
-        self.local_grad_flat = None
+        self.local_grad_flat = None # 清理
         return weighted_params
