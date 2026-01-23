@@ -38,11 +38,11 @@ defense:
   target_layers: 
     - "conv1.weight"
     - "fc3.weight"
-    
+
   params:
     # DBSCAN 聚类参数
-    dbscan_eps: 0.5          # 邻域半径 (Non-IID 越严重，这个值要越大)
-    dbscan_min_samples: 3    # 最小核心点数
+    dbscan_eps: 0.35          # 邻域半径 (Non-IID 越严重，这个值要越大)
+    dbscan_min_samples: 2    # 最小核心点数
     
     # 统计筛除参数
     l2_threshold_multiplier: 3.0  # L2范数阈值倍数 (Median + k * MAD)
