@@ -3,7 +3,6 @@ import copy
 from _utils_.LSH_proj_extra import SuperBitLSH
 from defence.score import ScoreCalculator
 from defence.kickout import KickoutManager
-# 确保引用路径正确
 from defence.layers_proj_detect import Layers_Proj_Detector
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -16,56 +15,81 @@ class Server:
         self.detection_method = detection_method
         self.verbose = verbose  # 保存日志配置
         
+        # 状态维护
         self.suspect_counters = {} 
         self.global_update_direction = None 
         
+        # 组件初始化
         self.mesas_detector = Layers_Proj_Detector()
         
+        # 保留原有组件以兼容旧逻辑
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
             
         self.current_round_weights = {}
 
-    # ... (generate_projection_matrix, get_global_params_and_proj 保持不变) ...
+    def generate_projection_matrix(self, input_dim, output_dim, matrix_file_path=None):
+        """步骤1: 生成投影矩阵"""
+        if matrix_file_path is None:
+            matrix_file_path = f"proj/projection_matrix_{input_dim}x{output_dim}.pt"
+        self.projection_matrix_path = self.superbit_lsh.generate_projection_matrix(
+            input_dim, output_dim, device='cpu', matrix_file_path=matrix_file_path
+        )
+
+    def get_global_params_and_proj(self):
+        """步骤3: 获取分发给客户端的参数"""
+        return copy.deepcopy(self.global_model.state_dict()), self.projection_matrix_path
 
     def calculate_weights(self, client_id_list, client_features_dict_list, client_data_sizes):
+        """
+        步骤7: 检测并计算权重
+        """
+        # 重组数据: list -> dict {cid: feature_dict}
         client_projections = {
             cid: feat 
             for cid, feat in zip(client_id_list, client_features_dict_list)
         }
 
+        # 1. 更新全局方向 (先更新还是后更新取决于具体逻辑，这里选择使用本轮数据更新供下一轮使用)
+        # 注意：这里我们使用本轮所有客户端(在剔除前)的投影之和作为"本轮的整体方向"
         self._update_global_direction_feature(client_projections)
+
         weights = {}
 
+        # 2. 执行检测
         if "mesas" in self.detection_method or "projected" in self.detection_method:
             if self.verbose:
                 print(f"  [Server] Executing {self.detection_method} detection...")
 
+            # 使用新的检测器 (返回原始分数)
             raw_weights, logs = self.mesas_detector.detect(
                 client_projections, 
                 self.global_update_direction, 
                 self.suspect_counters
             )
             
-            # [新增] 详细打印检测结果
+            # 详细打印检测结果
             if self.verbose:
                 print(f"  [Server] Detection Results:")
-                for cid, status in logs.items():
-                    # 假设 logs 返回的是 raw_metrics，其中包含 status 字段
-                    st = status.get('status', 'UNKNOWN') if isinstance(status, dict) else 'N/A'
+                for cid in sorted(logs.keys()):
+                    status = logs[cid].get('status', 'N/A')
                     score = raw_weights.get(cid, 0.0)
-                    print(f"    - Client {cid}: Score={score:.2f} | Status={st}")
+                    print(f"    - Client {cid}: Score={score:.2f} | Status={status}")
 
+            # 归一化权重
             total_score = sum(raw_weights.values())
             if total_score > 0:
                 weights = {cid: s / total_score for cid, s in raw_weights.items()}
             else:
-                print("  [Warning] All clients kicked out this round!")
+                if self.verbose:
+                    print("  [Warning] All clients kicked out this round!")
                 weights = {cid: 0.0 for cid in raw_weights}
             
+            # 更新全局方向
             self._update_global_direction_feature(client_projections)
             
         else:
+            # Fallback 到旧逻辑
             full_features = [f['full'] for f in client_features_dict_list]
             weights = self._fallback_old_detection(client_id_list, full_features, client_data_sizes)
 
@@ -73,9 +97,7 @@ class Server:
         return weights
 
     def _update_global_direction_feature(self, client_projections):
-        """
-        步骤3: 更新全局方向
-        """
+        """步骤3: 更新全局方向"""
         if not client_projections:
             return
 
@@ -89,7 +111,7 @@ class Server:
         if self.global_update_direction is None:
             self.global_update_direction = agg_proj
         else:
-            # 直接替换 (无动量)
+            # 直接替换
             self.global_update_direction = agg_proj 
 
     def update_global_model(self, weighted_client_models_list, client_ids_list):
@@ -115,15 +137,11 @@ class Server:
         if valid_updates > 0:
             self.global_model.load_state_dict(agg_params)
         else:
-            print("  [Warning] 本轮无有效更新。")
-        
-        
+            if self.verbose:
+                print("  [Warning] No valid updates for aggregation.")
+
     def evaluate(self, test_loader):
-        """
-        模型评估
-        :param test_loader: 测试数据集加载器
-        :return: 测试准确率 (0-100)
-        """
+        """模型评估"""
         self.global_model.eval()
         correct = 0
         total = 0
@@ -135,12 +153,9 @@ class Server:
                 total += target.size(0)
                 correct += (predicted == target).sum().item()
         return 100 * correct / total
-        
+
     def _fallback_old_detection(self, ids, features, sizes):
-        """
-        兼容旧的 score + kickout 逻辑，以及无防御模式(FedAvg)
-        """
-        # Case 1: 无防御模块 (FedAvg)
+        """兼容旧逻辑"""
         if not self.score_calculator and not self.kickout_manager:
             total_size = sum(sizes)
             if total_size > 0:
@@ -148,31 +163,23 @@ class Server:
             else:
                 return {cid: 1.0 / len(ids) for cid in ids}
 
-        # Case 2: 只有 Kickout (无 Score) - 极其少见，暂不支持或退化为均权
         if self.kickout_manager and not self.score_calculator:
              return {cid: 1.0 / len(ids) for cid in ids}
 
-        # Case 3: 正常流程 Score -> Kickout
-        # 3.1 计算分数
         client_scores = {}
         for i, cid in enumerate(ids):
             client_scores[cid] = self.score_calculator.calculate_scores(
                 cid, features[i], sizes[i]
             )
 
-        # 3.2 确定权重
         weights = {}
         if self.kickout_manager:
-            # KickoutManager 内部已经包含了归一化逻辑 (return normalized weights)
             weights = self.kickout_manager.determine_weights(client_scores)
         else:
-            # Case 4: 只有 Score (无 Kickout)
-            # 直接使用 final_score 并归一化
             raw_scores = {cid: s['final_score'] for cid, s in client_scores.items()}
             total_s = sum(raw_scores.values())
             if total_s > 0:
                 weights = {cid: s / total_s for cid, s in raw_scores.items()}
             else:
                 weights = {cid: 1.0 / len(ids) for cid in ids}
-                
         return weights
