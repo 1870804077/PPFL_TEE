@@ -9,7 +9,7 @@ experiment:
 
 # ================= 联邦学习参数 =================
 federated:
-  comm_rounds: 100
+  comm_rounds: 10
   total_clients: 20
   active_clients: 20
   local_epochs: 5
@@ -18,14 +18,14 @@ federated:
   
 # ================= 数据与模型 =================
 data:
-  dataset: "cifar10"  # mnist, cifar10
-  model: "cifar10"    # lenet5, cifar10
+  dataset: "mnist"  # mnist, cifar10
+  model: "lenet5"    # lenet5, cifar10
   if_noniid: false
   alpha: 0.5          # Non-IID 的狄利克雷分布参数
 
 # ================= 防御策略 =================
 defense:
-  method: "lsh_score_kickout" # none, lsh_score_kickout, only_score, only_kickout
+  method: "layers_proj_detect" # none, lsh_score_kickout, only_score, only_kickout, layers_proj_detect
   target_layers: 
     - "conv1.weight"
     - "fc3.weight"
@@ -37,7 +37,7 @@ attack:
   active_attacks: 
     - "label_flip"
   
-  # 具体攻击参数 (MESAS 对齐)
+  # 具体攻击参数 
   params:
     random_poison:
       noise_std: 0.5

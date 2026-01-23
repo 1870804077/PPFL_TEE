@@ -61,7 +61,7 @@ class Server:
         weights = {}
 
         # 2. 执行检测
-        if "mesas" in self.detection_method or "projected" in self.detection_method:
+        if "layers" in self.detection_method or "proj" in self.detection_method:
             # 使用新的检测器 (返回原始分数，如 10.0, 1.0 等)
             raw_weights, logs = self.mesas_detector.detect(
                 client_projections, 
@@ -136,6 +136,25 @@ class Server:
             self.global_model.load_state_dict(agg_params)
         else:
             print("  [Warning] 本轮无有效更新。")
+        
+        
+    def evaluate(self, test_loader):
+        """
+        模型评估
+        :param test_loader: 测试数据集加载器
+        :return: 测试准确率 (0-100)
+        """
+        self.global_model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(DEVICE), target.to(DEVICE)
+                outputs = self.global_model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
+        return 100 * correct / total
         
     def _fallback_old_detection(self, ids, features, sizes):
         """
