@@ -6,6 +6,7 @@ import yaml
 import argparse
 import sys
 import gc
+import time 
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -29,7 +30,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     data_conf = full_config['data']
     attack_conf = full_config['attack']
     
-    # [新增] 提取日志配置
+    # 提取日志配置
     verbose = full_config['experiment'].get('verbose', False)
     log_interval = full_config['experiment'].get('log_interval', 100)
 
@@ -67,7 +68,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         init_model, 
         detection_method=current_mode_config['defense_method'], 
         seed=full_config['experiment']['seed'],
-        verbose=verbose # 传递 verbose
+        verbose=verbose
     )
     
     matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}.pt"
@@ -88,6 +89,10 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     attack_params_dict = attack_conf.get('params', {})
     attack_idx = 0
 
+    # 记录实际使用的攻击配置用于ASR检测
+    primary_attack_type = None
+    primary_attack_params = {}
+
     for cid in range(fed_conf['total_clients']):
         poison_loader = None
         if cid in poison_client_ids and active_attacks:
@@ -95,6 +100,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             attack_idx += 1
             a_params = attack_params_dict.get(a_type, {})
             poison_loader = PoisonLoader([a_type], a_params)
+            
+            # 记录第一个攻击类型用于评估 ASR
+            if primary_attack_type is None:
+                primary_attack_type = a_type
+                primary_attack_params = a_params
             
             if verbose:
                 print(f"  [Init] Client {cid} set as Malicious ({a_type})")
@@ -106,16 +116,20 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             all_client_dataloaders[cid], 
             model_class, 
             poison_loader,
-            verbose=verbose,          # 传递
-            log_interval=log_interval # 传递
+            verbose=verbose,
+            log_interval=log_interval
         ))
 
     # 5. 训练循环
     accuracy_history = []
+    asr_history = [] # ASR 历史
     total_rounds = fed_conf['comm_rounds']
     target_layers_config = full_config['defense'].get('target_layers', [])
     
     print(f"\n>>> 开始训练: {mode_name} | 恶意比例: {current_poison_ratio} | 防御: {current_mode_config['defense_method']}")
+    
+    # 开始计时
+    start_time = time.time()
     
     for r in range(1, total_rounds + 1):
         global_params, proj_path = server.get_global_params_and_proj()
@@ -129,16 +143,14 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         for cid in active_ids:
             client = clients[cid]
             client.receive_model_and_proj(global_params, proj_path)
-            
             _ = client.local_train()
-            
             feature_dict = client.generate_gradient_projection(target_layers=target_layers_config)
-            
             round_features.append(feature_dict)
             round_data_sizes.append(len(client.dataloader.dataset))
         
         # Phase 2: 检测 & 聚合
-        weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes)
+        # 传入当前轮次以便日志记录
+        weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes, current_round=r)
         
         for cid in active_ids:
             client = clients[cid]
@@ -154,14 +166,46 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         
         server.update_global_model(valid_models, valid_ids)
         
+        # 评估
         acc = server.evaluate(test_loader)
         accuracy_history.append(acc)
         
-        print(f"  Round {r}/{total_rounds} | Accuracy: {acc:.2f}%")
+        # ASR 评估
+        asr_str = ""
+        if current_poison_ratio > 0 and primary_attack_type in ["label_flip", "backdoor"]:
+            asr = server.evaluate_asr(test_loader, primary_attack_type, primary_attack_params)
+            asr_history.append(asr)
+            asr_str = f" | ASR: {asr:.2f}%"
+        
+        print(f"  Round {r}/{total_rounds} | Accuracy: {acc:.2f}%{asr_str}")
             
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    #  结束计时与总结报告
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    print("\n" + "="*50)
+    print(f"  实验总结报告 ({mode_name})")
+    print("="*50)
+    print(f"  总耗时     : {total_time:.2f} seconds ({total_time/60:.2f} mins)")
+    print(f"  最终准确率 : {accuracy_history[-1]:.2f}%")
+    if asr_history:
+        print(f"  最终 ASR   : {asr_history[-1]:.2f}%")
+        
+    # 打印检测统计
+    if server.detection_history:
+        print("\n  [防御拦截统计]")
+        print(f"  {'Client ID':<10} {'Suspect Count':<15} {'Kicked Count':<15} {'Details'}")
+        print("  " + "-"*60)
+        for cid, stats in sorted(server.detection_history.items()):
+            # 只打印有异常记录的
+            if stats['suspect_cnt'] > 0 or stats['kicked_cnt'] > 0:
+                events_str = ",".join(stats['events'][-5:]) # 只显示最近5个事件
+                print(f"  {cid:<10} {stats['suspect_cnt']:<15} {stats['kicked_cnt']:<15} {events_str}...")
+    print("="*50 + "\n")
 
     save_result_with_config(
         save_dir=full_config['experiment']['save_dir'],

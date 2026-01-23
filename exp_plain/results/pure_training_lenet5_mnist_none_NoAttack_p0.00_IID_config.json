@@ -1,0 +1,13 @@
+{
+    "total_clients": 20,
+    "batch_size": 64,
+    "comm_rounds": 10,
+    "if_noniid": false,
+    "alpha": 0.5,
+    "attack_types": [
+        "label_flip"
+    ],
+    "seed": 42,
+    "poison_ratio": 0.0,
+    "defense_method": "none"
+}

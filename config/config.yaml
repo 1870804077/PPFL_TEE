@@ -5,18 +5,18 @@ experiment:
   seed: 42
   save_dir: "results"
   device: "cuda"  # auto, cuda, or cpu
-  modes: "all"
+  modes: "poison_no_detection"  #pure_training poison_no_detection poison_with_detection all
   verbose: true        # 是否开启详细日志
-  log_interval: 32   # 训练时每隔多少个 batch 打印一次进度
+  log_interval: 100   # 训练时每隔多少个 batch 打印一次进度
 
 # ================= 联邦学习参数 =================
 federated:
   comm_rounds: 10
   total_clients: 20
   active_clients: 20
-  local_epochs: 5
+  local_epochs: 3
   batch_size: 64
-  lr: 0.01
+  lr: 0.005
   
 # ================= 数据与模型 =================
 data:

@@ -38,7 +38,7 @@ class PoisonLoader:
         initial_flat = initial_model.get_flat_params()
 
         criterion = nn.CrossEntropyLoss()
-        local_epochs = self.attack_params.get("local_epochs", 5)
+        local_epochs = self.attack_params.get("local_epochs", 3)
 
         for epoch in range(local_epochs):
             for batch_idx, (data, target) in enumerate(dataloader):
