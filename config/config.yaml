@@ -5,6 +5,7 @@ experiment:
   seed: 42
   save_dir: "results"
   device: "cuda"  # auto, cuda, or cpu
+  modes: "all"
 
 # ================= 联邦学习参数 =================
 federated:

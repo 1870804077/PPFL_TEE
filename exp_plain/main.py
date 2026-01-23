@@ -24,24 +24,28 @@ def get_device(config_device):
     return torch.device(config_device)
 
 def run_single_mode(full_config, mode_name, current_mode_config):
-    device = get_device(full_config['experiment'].get('device', 'auto'))
+    # 使用 current_mode_config (包含了当前模式特定的 poison_ratio 等) 来检查结果
+    # 这一点非常重要，否则 check_result_exists 生成的文件名会是默认参数的，导致误判
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     attack_conf = full_config['attack']
     
-    # --- 结果检查 ---
+    # --- 1. 结果存在性检查 ---
     exists, acc_history = check_result_exists(
         save_dir=full_config['experiment']['save_dir'],
         mode_name=mode_name,
         model_type=data_conf['model'],
         dataset_type=data_conf['dataset'],
         detection_method=current_mode_config['defense_method'],
-        config=current_mode_config
+        config=current_mode_config  # 传入当前模式的特定配置
     )
     if exists:
+        print(f"模式 {mode_name} 已完成，直接返回结果。")
         return np.array(acc_history)
 
-    # --- 数据加载 ---
+    device = get_device(full_config['experiment'].get('device', 'auto'))
+
+    # --- 2. 数据准备 ---
     all_client_dataloaders, test_loader = load_and_split_dataset(
         dataset_name=data_conf['dataset'],
         num_clients=fed_conf['total_clients'],
@@ -51,7 +55,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         data_dir="./data"
     )
 
-    # --- 步骤 2: Server 启动并生成初始化模型 ---
+    # --- 3. 初始化 Server ---
     model_class = LeNet5 if data_conf['model'] == 'lenet5' else CIFAR10Net
     init_model = model_class()
     model_param_dim = sum(p.numel() for p in init_model.parameters())
@@ -62,15 +66,14 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         seed=full_config['experiment']['seed']
     )
     
-    # --- 步骤 1: 生成投影矩阵 ---
+    # 生成/加载投影矩阵
     matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}.pt"
-    # 这里默认生成 1024 维，如果需要分层，底层 SuperBitLSH 还是加载这个全量矩阵，
-    # 客户端 extract_feature 时通过 start_idx 访问
     server.generate_projection_matrix(model_param_dim, min(1024, model_param_dim), matrix_path)
 
-    # --- 客户端初始化 ---
+    # --- 4. 初始化 Client ---
     poison_client_ids = []
     current_poison_ratio = current_mode_config.get('poison_ratio', 0.0)
+    
     if current_poison_ratio > 0:
         poison_client_ids = random.sample(
             range(fed_conf['total_clients']), 
@@ -93,68 +96,61 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             poison_loader = PoisonLoader([], {})
         clients.append(Client(cid, all_client_dataloaders[cid], model_class, poison_loader))
 
-    # --- 训练主循环 ---
+    # --- 5. 训练循环 ---
     accuracy_history = []
     total_rounds = fed_conf['comm_rounds']
     
-    print(f"\n开始训练: {mode_name} | 轮数: {total_rounds}")
+    print(f"\n>>> 开始训练: {mode_name} | 恶意比例: {current_poison_ratio} | 防御: {current_mode_config['defense_method']}")
     
     for r in range(1, total_rounds + 1):
-        # --- 步骤 3: Server 发送模型参数 ---
         global_params, proj_path = server.get_global_params_and_proj()
-        
-        # 客户端选择
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         
-        # 暂存本轮数据
         round_features = []
         round_data_sizes = []
         round_weighted_models = []
         
-        # >>> Phase 1: 训练与检测 <<<
+        # Phase 1: 本地训练 & 投影
         for cid in active_ids:
             client = clients[cid]
             client.receive_model_and_proj(global_params, proj_path)
             
-            # --- 步骤 4: 客户端执行本地训练 ---
-            # 返回梯度/update用于投影，但不立即上传参数
-            _ = client.local_train() 
+            # 训练 (返回梯度用于投影)
+            _ = client.local_train()
             
-            # --- 步骤 5: 客户端执行投影 ---
-            # 这里 start_idx=0 表示对全量参数投影。
-            # 如果需要只对某一层投影，可以在这里修改 start_idx 和 LSH 内部逻辑
+            # 投影 (Step 5) - 使用 LSH 的分批次计算避免 OOM
             feature = client.generate_gradient_projection(start_idx=0)
             
-            # --- 步骤 6: 上传投影至 Server (暂存) ---
             round_features.append(feature)
             round_data_sizes.append(len(client.dataloader.dataset))
         
-        # --- 步骤 7: Server 返回检测结果(权重) ---
-        # Server 根据收集到的所有 feature 计算权重
+        # Phase 2: 检测 & 聚合
         weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes)
         
-        # >>> Phase 2: 加权上传与聚合 <<<
         for cid in active_ids:
             client = clients[cid]
             w = weights_map.get(cid, 0.0)
-            
-            # --- 步骤 8: 客户端计算全量参数 * 权重并上传 ---
-            # 如果被剔除 (w=0)，理论上可以不传以节省带宽，但这里逻辑统一处理
-            weighted_params = client.prepare_upload_weighted_params(w)
-            round_weighted_models.append(weighted_params)
-            
-        # --- 步骤 9: Server 聚合更新 ---
-        server.update_global_model(round_weighted_models, active_ids)
+            # 只有权重 > 0 才计算和上传，节省算力
+            if w > 0:
+                weighted_params = client.prepare_upload_weighted_params(w)
+                round_weighted_models.append(weighted_params)
+            else:
+                # 保持列表对齐，或者让 Server 处理空缺
+                round_weighted_models.append(None)
+                
+        # 过滤掉 None
+        valid_models = [m for m in round_weighted_models if m is not None]
+        valid_ids = [cid for i, cid in enumerate(active_ids) if round_weighted_models[i] is not None]
         
-        # --- 步骤 10: Server 准备下一轮 (Loop continues) ---
+        server.update_global_model(valid_models, valid_ids)
         
         # 评估
         acc = server.evaluate(test_loader)
         accuracy_history.append(acc)
         
         if r % 10 == 0 or r == 1:
-            print(f"  Round {r} | Acc: {acc:.2f}%")
-        
+            print(f"  Round {r}/{total_rounds} | Accuracy: {acc:.2f}%")
+            
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -178,10 +174,13 @@ def load_config(config_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config/config.yaml')
+    # 允许通过命令行覆盖运行模式，例如: python main.py --mode poison_with_detection
+    parser.add_argument('--mode', type=str, default=None, help='指定只运行某个模式(逗号分隔)')
     args = parser.parse_args()
+    
     config = load_config(args.config)
     
-    # 构建对比模式配置 (保持之前的逻辑)
+    # 构造基础配置用于扁平化
     base_flat_config = {
         'total_clients': config['federated']['total_clients'],
         'batch_size': config['federated']['batch_size'],
@@ -195,20 +194,49 @@ def main():
     default_poison_ratio = config['attack']['poison_ratio']
     default_defense = config['defense']['method']
 
-    modes = [
-        {'name': 'pure_training', 'mode_config': {**base_flat_config, 'poison_ratio': 0.0, 'defense_method': 'none'}},
-        {'name': 'poison_no_detection', 'mode_config': {**base_flat_config, 'poison_ratio': default_poison_ratio, 'defense_method': 'none'}},
-        {'name': 'poison_with_detection', 'mode_config': {**base_flat_config, 'poison_ratio': default_poison_ratio, 'defense_method': default_defense}}
+    # 定义所有可用模式
+    all_modes = [
+        {
+            'name': 'pure_training', 
+            'mode_config': {**base_flat_config, 'poison_ratio': 0.0, 'defense_method': 'none'}
+        },
+        {
+            'name': 'poison_no_detection', 
+            'mode_config': {**base_flat_config, 'poison_ratio': default_poison_ratio, 'defense_method': 'none'}
+        },
+        {
+            'name': 'poison_with_detection', 
+            'mode_config': {**base_flat_config, 'poison_ratio': default_poison_ratio, 'defense_method': default_defense}
+        }
     ]
+    
+    # --- 模式选择逻辑 ---
+    # 优先级: 命令行参数 > Config文件 > 默认全部
+    target_modes_str = args.mode
+    if target_modes_str is None:
+        target_modes_str = config['experiment'].get('modes', 'all') # 在 yaml 中可以写 modes: "poison_with_detection"
+    
+    modes_to_run = []
+    if target_modes_str == 'all' or not target_modes_str:
+        modes_to_run = all_modes
+    else:
+        # 支持逗号分隔多个模式
+        target_names = [m.strip() for m in target_modes_str.split(',')]
+        modes_to_run = [m for m in all_modes if m['name'] in target_names]
+        if not modes_to_run:
+            print(f"警告: 未找到名称为 {target_names} 的模式。可用模式: {[m['name'] for m in all_modes]}")
 
-    for mode in modes:
-        print(f"\n>>> Mode: {mode['name']}")
+    print(f"计划运行模式: {[m['name'] for m in modes_to_run]}")
+
+    for mode in modes_to_run:
         run_single_mode(config, mode['name'], mode['mode_config'])
 
-    # 绘图
-    plot_path = os.path.join(config['experiment']['save_dir'], f"comparison_{default_defense}_{config['data']['dataset']}.png")
-    plot_config = {**base_flat_config, 'poison_ratio': default_poison_ratio}
-    plot_comparison_curves(plot_config, config['experiment']['save_dir'], plot_path)
+    # 绘图 (只有当运行了模式时才绘图)
+    if modes_to_run:
+        plot_path = os.path.join(config['experiment']['save_dir'], f"comparison_{default_defense}_{config['data']['dataset']}.png")
+        # 绘图时使用基础配置即可，plot_comparison_curves 会扫描目录下所有匹配的文件
+        plot_config = {**base_flat_config, 'poison_ratio': default_poison_ratio}
+        plot_comparison_curves(plot_config, config['experiment']['save_dir'], plot_path)
 
 if __name__ == "__main__":
     main()
