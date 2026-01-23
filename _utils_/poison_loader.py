@@ -25,23 +25,21 @@ class PoisonLoader:
             if method not in self.valid_attacks:
                 raise ValueError(f"不支持的投毒方式: {method}")
 
-    def execute_attack(self, model, dataloader, model_class, device='cpu', optimizer=None):
+    def execute_attack(self, model, dataloader, model_class, device='cpu', optimizer=None, verbose=False, uid="?", log_interval=100):
         """
         统一的攻击执行入口
         """
-        # 1. 特殊情况：随机攻击不需要训练，直接生成噪声参数
         if "random_poison" in self.attack_methods:
             return self._execute_random_poison(model, model_class, device)
 
-        # 2. 通用投毒训练流程 (Train-and-Scale)
-        # 涵盖了: 正常训练、数据层投毒(Flip/Backdoor)、以及训练后的梯度修饰(Compress/Amplify/Scale)
+        # 传递日志参数给训练流程
         trained_params, grad_flat = self._standard_training_process(
-            model, dataloader, model_class, device, optimizer
+            model, dataloader, model_class, device, optimizer, verbose, uid, log_interval
         )
         
         return trained_params, grad_flat
 
-    def _standard_training_process(self, model, dataloader, model_class, device, optimizer):
+    def _standard_training_process(self, model, dataloader, model_class, device, optimizer, verbose, uid, log_interval):
         """
         标准训练流程封装：
         1. 保存初始状态
@@ -52,19 +50,20 @@ class PoisonLoader:
         """
         model.train()
         
-        # 保存初始模型状态，用于计算 update (Delta W)
         initial_model = model_class().to(device)
         initial_model.load_state_dict(copy.deepcopy(model.state_dict()))
         initial_flat = initial_model.get_flat_params()
 
         criterion = nn.CrossEntropyLoss()
-        local_epochs = self.attack_params.get("local_epochs", 5) # 默认本地训练5轮
+        local_epochs = self.attack_params.get("local_epochs", 5)
 
+        # -------------------------------------------------
+        # [新增] 训练循环日志
+        # -------------------------------------------------
         for epoch in range(local_epochs):
-            for data, target in dataloader:
+            for batch_idx, (data, target) in enumerate(dataloader):
                 data, target = data.to(device), target.to(device)
 
-                # [Hook 1] 应用数据层投毒 (Label Flip, Backdoor, etc.)
                 data, target = self.apply_data_poison(data, target)
 
                 optimizer.zero_grad()
@@ -72,26 +71,26 @@ class PoisonLoader:
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
+                
+                # 打印进度日志
+                if verbose and (batch_idx % log_interval == 0):
+                    print(f"    [Client {uid}] Epoch {epoch+1}/{local_epochs} | Batch {batch_idx}/{len(dataloader)} | Loss: {loss.item():.4f}")
 
-        # 计算原始 update (grad_flat)
         trained_flat = model.get_flat_params()
         grad_flat = trained_flat - initial_flat
 
-        # [Hook 2] 应用梯度层投毒 (Scaling, Compression, Noise, Inversion)
         grad_flat = self.apply_gradient_poison(grad_flat)
 
-        # 更新最终的模型参数以匹配修改后的梯度 (这一步很重要，否则返回的参数和梯度不匹配)
-        # W_new = W_old + Modified_Update
         final_flat = initial_flat + grad_flat
         self._load_flat_params_to_model(model, final_flat)
 
-        # 清理内存
         del initial_model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return copy.deepcopy(model.state_dict()), grad_flat
+
 
     def _execute_random_poison(self, model, model_class, device):
         """

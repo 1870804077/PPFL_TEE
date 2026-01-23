@@ -7,7 +7,7 @@ from _utils_.LSH_proj_extra import SuperBitLSH
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Client:
-    def __init__(self, client_id, dataloader, model_class, poison_loader=None):
+    def __init__(self, client_id, dataloader, model_class, poison_loader=None, verbose=False, log_interval=100):
         self.client_id = client_id
         self.dataloader = dataloader
         self.model_class = model_class
@@ -16,25 +16,24 @@ class Client:
         self.optimizer = None
         self.superbit_lsh = SuperBitLSH()
         
-        # 暂存梯度
         self.local_grad_flat = None 
-        # 缓存层索引信息 {layer_name: (start_idx, length)}
         self.layer_indices = None
+        
+        # 保存日志配置
+        self.verbose = verbose
+        self.log_interval = log_interval
 
     def receive_model_and_proj(self, model_params, projection_matrix_path):
-        """接收模型，并初始化层索引信息"""
         if self.model is None:
             self.model = self.model_class().to(DEVICE)
         self.model.load_state_dict(model_params)
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
         self.superbit_lsh.set_projection_matrix_path(projection_matrix_path)
         
-        # 计算每层参数在 flatten 向量中的索引范围 (只需做一次)
         if self.layer_indices is None:
             self._calculate_layer_indices()
 
     def _calculate_layer_indices(self):
-        """辅助函数：计算每层参数的 (start, length)"""
         self.layer_indices = {}
         current_idx = 0
         for name, param in self.model.named_parameters():
@@ -43,9 +42,18 @@ class Client:
             current_idx += length
 
     def local_train(self):
-        """训练并返回梯度"""
+        if self.verbose:
+            print(f"  > [Client {self.client_id}] Start Local Training...")
+            
         trained_params, grad_flat = self.poison_loader.execute_attack(
-            self.model, self.dataloader, self.model_class, DEVICE, self.optimizer
+            self.model, 
+            self.dataloader, 
+            self.model_class, 
+            DEVICE, 
+            self.optimizer,
+            verbose=self.verbose,          
+            uid=self.client_id,            
+            log_interval=self.log_interval 
         )
         self.local_grad_flat = grad_flat
         return grad_flat

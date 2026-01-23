@@ -46,6 +46,9 @@ def run_single_mode(full_config, mode_name, current_mode_config):
 
     device = get_device(full_config['experiment'].get('device', 'auto'))
 
+    verbose = full_config['experiment'].get('verbose', False)
+    log_interval = full_config['experiment'].get('log_interval', 100)
+
     # --- 2. 数据准备 ---
     all_client_dataloaders, test_loader = load_and_split_dataset(
         dataset_name=data_conf['dataset'],
@@ -64,7 +67,8 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     server = Server(
         init_model, 
         detection_method=current_mode_config['defense_method'], 
-        seed=full_config['experiment']['seed']
+        seed=full_config['experiment']['seed'],
+        verbose=verbose
     )
     
     # 生成/加载投影矩阵
@@ -95,7 +99,8 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             poison_loader = PoisonLoader([a_type], a_params)
         else:
             poison_loader = PoisonLoader([], {})
-        clients.append(Client(cid, all_client_dataloaders[cid], model_class, poison_loader))
+        clients.append(Client(cid, all_client_dataloaders[cid], model_class, poison_loader,verbose=verbose, 
+            log_interval=log_interval))
 
     # --- 5. 训练循环 ---
     accuracy_history = []
