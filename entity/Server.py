@@ -20,6 +20,7 @@ class Server:
         self.log_file_path = log_file_path
         
         self.suspect_counters = {} 
+        # [修改] 全局方向现在初始化为 None，后续会变成字典 {'full': ..., 'layers': {...}}
         self.global_update_direction = None 
         self.detection_history = defaultdict(lambda: {'suspect_cnt': 0, 'kicked_cnt': 0, 'events': []})
         
@@ -30,7 +31,9 @@ class Server:
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
         self.current_round_weights = {}
 
-        if self.log_file_path and "mesas" in self.detection_method:
+        # 日志初始化
+        should_log = any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"])
+        if self.log_file_path and should_log:
             self._init_log_file()
 
     def _init_log_file(self):
@@ -40,14 +43,17 @@ class Server:
         
         headers = [
             "Round", "Client_ID", 
-            "Full_L2", "L2_Median", "L2_MAD", "L2_Threshold",
-            "Full_Var", "Var_Median", "Var_MAD", "Var_Threshold",
-            "Cos_Sim", "Cluster", 
+            "Full_L2", "L2_Threshold",
+            "Full_Var", "Var_Threshold",
+            "Min_Cos", "Comb_Cluster", # [修改] 记录最低相似度和综合聚类
             "Score", "Status"
         ]
-        with open(self.log_file_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
+        try:
+            with open(self.log_file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+        except Exception as e:
+            print(f"  [Warning] 无法初始化日志文件: {e}")
 
     def generate_projection_matrix(self, input_dim, output_dim, matrix_file_path=None):
         if matrix_file_path is None:
@@ -61,13 +67,16 @@ class Server:
 
     def calculate_weights(self, client_id_list, client_features_dict_list, client_data_sizes, current_round=0):
         client_projections = {cid: feat for cid, feat in zip(client_id_list, client_features_dict_list)}
+        
+        # 1. 更新全局方向 (包含 Full 和 Layers)
         self._update_global_direction_feature(client_projections)
         weights = {}
 
-        if "layers" in self.detection_method or "proj" in self.detection_method:
+        if any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"]):
             if self.verbose:
                 print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
 
+            # 2. 执行检测 (传入字典类型的 global_update_direction)
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, 
                 self.global_update_direction, 
@@ -75,11 +84,9 @@ class Server:
                 verbose=self.verbose 
             )
             
-            # 写入日志
             if self.log_file_path:
                 self._write_detection_log(current_round, logs, raw_weights, global_stats)
 
-            # 更新历史记录
             for cid in sorted(logs.keys()):
                 status = logs[cid].get('status', 'NORMAL')
                 if "SUSPECT" in status:
@@ -95,7 +102,9 @@ class Server:
             else:
                 weights = {cid: 0.0 for cid in raw_weights}
             
-            self._update_global_direction_feature(client_projections)
+            # 更新历史用于下一轮 (这里我们已经在第1步更新了，如果是用上一轮的历史来检测本轮，则逻辑顺序要调整，目前策略是用本轮平均值作为基准)
+            # 在 MESAS 原文中通常使用 Momentum update，这里简化为每轮重新计算 Aggregation
+            # self._update_global_direction_feature(client_projections) 
             
         else:
             full_features = [f['full'] for f in client_features_dict_list]
@@ -104,35 +113,58 @@ class Server:
         self.current_round_weights = weights
         return weights
 
-    def _write_detection_log(self, round_num, logs, raw_weights, stats):
-        """将本轮检测数据写入 CSV"""
-        with open(self.log_file_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            for cid in sorted(logs.keys()):
-                metrics = logs[cid]
-                row = [
-                    round_num, cid,
-                    f"{metrics.get('full_l2', 0):.4f}", 
-                    f"{stats['l2_median']:.4f}", f"{stats['l2_mad']:.4f}", f"{stats['l2_threshold']:.4f}",
-                    f"{metrics.get('full_var', 0):.4f}", 
-                    f"{stats['var_median']:.4f}", f"{stats['var_mad']:.4f}", f"{stats['var_threshold']:.4f}",
-                    f"{metrics.get('full_hist_cos', 0):.4f}",
-                    metrics.get('full_cluster', 0),
-                    f"{raw_weights.get(cid, 0):.2f}",
-                    metrics.get('status', 'UNKNOWN')
-                ]
-                writer.writerow(row)
-
     def _update_global_direction_feature(self, client_projections):
+        """更新全局历史方向 (Full + Layers)"""
         if not client_projections: return
-        first_proj = list(client_projections.values())[0]['full']
-        agg_proj = torch.zeros_like(first_proj, device=first_proj.device)
+        
+        # 获取第一个客户端的数据结构
+        first_cid = list(client_projections.keys())[0]
+        first_data = client_projections[first_cid]
+        
+        # 初始化结构
+        new_global = {
+            'full': torch.zeros_like(first_data['full'], device=first_data['full'].device),
+            'layers': {}
+        }
+        if 'layers' in first_data:
+            for lname, ltensor in first_data['layers'].items():
+                new_global['layers'][lname] = torch.zeros_like(ltensor, device=ltensor.device)
+        
+        # 累加
+        count = 0
         for cid, proj_data in client_projections.items():
-            agg_proj += proj_data['full']
-        if self.global_update_direction is None:
-            self.global_update_direction = agg_proj
-        else:
-            self.global_update_direction = agg_proj 
+            count += 1
+            new_global['full'] += proj_data['full']
+            if 'layers' in proj_data:
+                for lname, ltensor in proj_data['layers'].items():
+                    if lname in new_global['layers']:
+                        new_global['layers'][lname] += ltensor
+        
+        # (可选) 平均化，或者保持 Sum。这里保持 Sum 即可，Cosine Similarity 不受幅度影响。
+        self.global_update_direction = new_global
+
+    def _write_detection_log(self, round_num, logs, raw_weights, stats):
+        try:
+            with open(self.log_file_path, 'a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                for cid in sorted(logs.keys()):
+                    metrics = logs[cid]
+                    # 获取综合指标 (在 Detector 中计算好放入 metrics)
+                    min_cos = metrics.get('min_hist_cos', metrics.get('full_hist_cos', 0))
+                    comb_clust = metrics.get('combined_cluster', metrics.get('full_cluster', 0))
+                    
+                    row = [
+                        round_num, cid,
+                        f"{metrics.get('full_l2', 0):.4f}", f"{stats['l2_threshold']:.4f}",
+                        f"{metrics.get('full_var', 0):.4f}", f"{stats['var_threshold']:.4f}",
+                        f"{min_cos:.4f}", # 记录最低相似度
+                        comb_clust,       # 记录综合聚类状态
+                        f"{raw_weights.get(cid, 0):.2f}",
+                        metrics.get('status', 'UNKNOWN')
+                    ]
+                    writer.writerow(row)
+        except Exception:
+            pass
 
     def update_global_model(self, weighted_client_models_list, client_ids_list):
         if not weighted_client_models_list: return

@@ -82,10 +82,7 @@ def print_configuration_summary(mode_name, current_mode_config, full_config):
         def_conf = full_config['defense']
         print(f"    Projection Dim : {def_conf.get('projection_dim', 1024)}")
         print(f"    Target Layers  : {def_conf.get('target_layers', [])}")
-        print(f"    Params         :")
-        for k, v in def_conf.get('params', {}).items():
-            print(f"      {k:<22}: {v}")
-    
+        
     print("=" * 65 + "\n")
 
 # =======================================================
@@ -94,23 +91,20 @@ def print_configuration_summary(mode_name, current_mode_config, full_config):
 def task_client_train_and_project(client, global_params_cpu, proj_path, target_layers, device_str):
     """
     Phase 1: 本地训练 & 投影
+    返回: (cid, feature_dict_cpu, data_size, trained_params_cpu, error)
     """
     try:
         # 1. 在子进程内重建设备对象
         device = torch.device(device_str)
         
-        # 2. [修复点] 初始化模型
-        # 如果 model 为 None (首次运行或多进程不共享状态)，则先实例化
+        # 2. 初始化模型
         if client.model is None:
             client.model = client.model_class().to(device)
         else:
             client.model = client.model.to(device)
         
         # 3. 接收参数 (将 CPU 参数转到 GPU)
-        # receive_model_and_proj 内部会调用 load_state_dict
-        # 我们需要确保传入的 params 已经在目标 device 上，或者 rely on load_state_dict 的自动处理(通常需要同一 device)
         global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
-        
         client.receive_model_and_proj(global_params_device, proj_path)
         
         # 4. 本地训练
@@ -119,7 +113,8 @@ def task_client_train_and_project(client, global_params_cpu, proj_path, target_l
         # 5. 生成投影
         feature_dict = client.generate_gradient_projection(target_layers=target_layers)
         
-        # 6. [关键] 将结果转回 CPU
+        # 6. [关键] 提取结果转回 CPU
+        # 6.1 特征转 CPU
         feature_dict_cpu = {
             'full': feature_dict['full'].cpu(),
             'layers': {}
@@ -127,6 +122,10 @@ def task_client_train_and_project(client, global_params_cpu, proj_path, target_l
         if 'layers' in feature_dict:
             for k, v in feature_dict['layers'].items():
                 feature_dict_cpu['layers'][k] = v.cpu()
+        
+        # 6.2 [新增] 模型参数转 CPU (修复 NoneType 错误的核心)
+        # 必须显式返回参数，因为对 client.model 的修改无法同步回主进程
+        trained_params_cpu = {k: v.cpu() for k, v in client.model.state_dict().items()}
                 
         data_size = len(client.dataloader.dataset)
         
@@ -135,28 +134,22 @@ def task_client_train_and_project(client, global_params_cpu, proj_path, target_l
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        return client.client_id, feature_dict_cpu, data_size, None
+        return client.client_id, feature_dict_cpu, data_size, trained_params_cpu, None
         
     except Exception as e:
-        # 打印完整堆栈以便调试
         import traceback
         traceback.print_exc()
-        return client.client_id, None, 0, str(e)
+        return client.client_id, None, 0, None, str(e)
 
-def task_client_upload(client, weight):
-    """Phase 2: 计算加权参数"""
-    try:
-        if weight > 0:
-            # 在 task_client_train_and_project 结束时模型已经回到了 CPU
-            # 所以这里直接在 CPU 上操作即可
-            weighted_params = client.prepare_upload_weighted_params(weight)
-            # 确保是 CPU 张量
-            weighted_params_cpu = {k: v.cpu() for k, v in weighted_params.items()}
-            return client.client_id, weighted_params_cpu, None
+def apply_weight_to_params(params, weight):
+    """Phase 2: 本地计算加权参数 (替代 Client 方法)"""
+    weighted_params = {}
+    for key, param in params.items():
+        if param.dtype in [torch.float32, torch.float64]:
+            weighted_params[key] = param * weight
         else:
-            return client.client_id, None, None
-    except Exception as e:
-        return client.client_id, None, str(e)
+            weighted_params[key] = param
+    return weighted_params
 
 def run_single_mode(full_config, mode_name, current_mode_config):
     fed_conf = full_config['federated']
@@ -272,13 +265,15 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         global_params, proj_path = server.get_global_params_and_proj()
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         
-        # 准备传给子进程的参数 (必须是 CPU 版本)
+        # 准备参数 (CPU)
         if use_multiprocessing:
             global_params_for_worker = {k: v.cpu() for k, v in global_params.items()}
         else:
             global_params_for_worker = global_params
             
-        round_results_buffer = {}
+        # 结果缓存
+        round_results_buffer = {} # {cid: (feature, size)}
+        round_params_buffer = {}  # {cid: params}
         
         # >>> Phase 1: 并行本地训练 <<<
         with ExecutorClass(max_workers=worker_count) as executor:
@@ -295,13 +290,14 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             }
             
             for future in as_completed(futures):
-                cid, feature_dict, data_size, err = future.result()
+                cid, feature_dict, data_size, trained_params, err = future.result()
                 if err:
                     print(f"  [Error] Client {cid} training failed: {err}")
                 else:
                     round_results_buffer[cid] = (feature_dict, data_size)
+                    round_params_buffer[cid] = trained_params
         
-        # 整理数据
+        # 整理数据 (确保 active_ids 顺序)
         round_features = []
         round_data_sizes = []
         for cid in active_ids:
@@ -322,34 +318,23 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         # >>> Phase 2: 检测 <<<
         weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes, current_round=r)
         
-        # >>> Phase 3: 并行加权上传 <<<
-        round_models_buffer = {}
-        with ExecutorClass(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(
-                    task_client_upload, 
-                    clients[cid], 
-                    weights_map.get(cid, 0.0)
-                ): cid 
-                for cid in active_ids
-            }
-            
-            for future in as_completed(futures):
-                cid, w_params, err = future.result()
-                if err:
-                    print(f"  [Error] Client {cid} upload failed: {err}")
-                else:
-                    round_models_buffer[cid] = w_params
-
+        # >>> Phase 3: 加权 (主进程直接计算，替代原先的并行上传) <<<
         valid_models = []
         valid_ids = []
-        for cid in active_ids:
-            m = round_models_buffer.get(cid)
-            if m is not None:
-                m_device = {k: v.to(device) for k, v in m.items()}
-                valid_models.append(m_device)
-                valid_ids.append(cid)
         
+        for cid in active_ids:
+            weight = weights_map.get(cid, 0.0)
+            if weight > 0 and cid in round_params_buffer:
+                # 获取训练好的参数
+                params = round_params_buffer[cid]
+                # 加权 (CPU操作)
+                weighted_params = apply_weight_to_params(params, weight)
+                # 转回 GPU 准备聚合
+                weighted_params_device = {k: v.to(device) for k, v in weighted_params.items()}
+                
+                valid_models.append(weighted_params_device)
+                valid_ids.append(cid)
+
         # >>> Phase 4: 聚合 & 评估 <<<
         server.update_global_model(valid_models, valid_ids)
         acc = server.evaluate(test_loader)
