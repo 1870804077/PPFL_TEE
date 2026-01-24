@@ -247,6 +247,10 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     # 打印配置
     print_configuration_summary(mode_name, current_mode_config, full_config)
     print(f"  [Init] Projection Matrix: {model_param_dim} -> {final_output_dim}")
+    if current_poison_ratio > 0:
+        print(f"  [Init] Malicious Clients (Total {len(poison_client_ids)}): {sorted(poison_client_ids)}")
+    else:
+        print(f"  [Init] Malicious Clients: None")
     print("\n>>> Training Start...")
 
     # 选择执行器
