@@ -1,4 +1,5 @@
 import torch
+import torch.multiprocessing as mp
 import numpy as np
 import random
 import os
@@ -7,7 +8,7 @@ import argparse
 import sys
 import gc
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(project_root)
@@ -20,54 +21,144 @@ from _utils_.save_config import check_result_exists, save_result_with_config, pl
 from entity.Server import Server
 from entity.Client import Client
 
+# 强制设置多进程启动方式
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
 def get_device(config_device):
     if config_device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(config_device)
 
 # =======================================================
-#  线程任务函数：Phase 1 本地训练
+# 配置打印辅助函数
 # =======================================================
-def task_client_train_and_project(client, global_params, proj_path, target_layers):
-    """
-    单个客户端的训练任务：接收参数 -> 本地训练 -> 生成投影
-    """
-    try:
-        # 1. 接收模型
-        client.receive_model_and_proj(global_params, proj_path)
-        
-        # 2. 本地训练
-        # 注意：多线程下 print 可能会乱序，verbose建议在主线程控制或减少打印
-        _ = client.local_train()
-        
-        # 3. 生成投影
-        feature_dict = client.generate_gradient_projection(target_layers=target_layers)
-        
-        # 4. 获取数据量
-        data_size = len(client.dataloader.dataset)
-        
-        return client.client_id, feature_dict, data_size, None # None 是 error placeholder
-    except Exception as e:
-        return client.client_id, None, 0, e
+def print_configuration_summary(mode_name, current_mode_config, full_config):
+    """打印详细的实验配置清单"""
+    print("\n" + "=" * 65)
+    print(f"  Configuration Summary | Mode: {mode_name}")
+    print("=" * 65)
+    
+    exp = full_config['experiment']
+    print(f" [Experiment]")
+    print(f"    Device         : {exp.get('device', 'auto')}")
+    print(f"    Seed           : {exp['seed']}")
+    concurrency_type = "Multiprocessing" if exp.get('use_multiprocessing', False) else "Threading"
+    print(f"    Concurrency    : {concurrency_type} (Workers: {exp.get('thread_count', 1)})")
+    
+    fed = full_config['federated']
+    print(f" [Federated]")
+    print(f"    Rounds         : {fed['comm_rounds']}")
+    print(f"    Clients        : {fed['total_clients']} (Active: {fed['active_clients']})")
+    print(f"    Local Epochs   : {fed['local_epochs']}")
+    print(f"    Batch Size     : {fed['batch_size']}")
+    print(f"    Learning Rate  : {fed.get('lr', 0.01)}")
+    
+    data = full_config['data']
+    print(f" [Data]")
+    print(f"    Dataset        : {data['dataset']}")
+    print(f"    Model          : {data['model']}")
+    print(f"    Non-IID        : {data['if_noniid']} (Alpha: {data['alpha']})")
+    
+    print(f" [Attack]")
+    poison_ratio = current_mode_config.get('poison_ratio', 0.0)
+    print(f"    Poison Ratio   : {poison_ratio}")
+    if poison_ratio > 0:
+        attacks = full_config['attack'].get('active_attacks', [])
+        print(f"    Active Attacks : {attacks}")
+        for atk in attacks:
+            params = full_config['attack'].get('params', {}).get(atk, {})
+            param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
+            print(f"      - {atk:<12}: {param_str}")
+    else:
+        print(f"    Active Attacks : None (Benign)")
+
+    print(f" [Defense]")
+    method = current_mode_config.get('defense_method', 'none')
+    print(f"    Method         : {method}")
+    if method != 'none' and 'defense' in full_config:
+        def_conf = full_config['defense']
+        print(f"    Projection Dim : {def_conf.get('projection_dim', 1024)}")
+        print(f"    Target Layers  : {def_conf.get('target_layers', [])}")
+        print(f"    Params         :")
+        for k, v in def_conf.get('params', {}).items():
+            print(f"      {k:<22}: {v}")
+    
+    print("=" * 65 + "\n")
 
 # =======================================================
-#  线程任务函数：Phase 2 加权上传
+# 核心任务函数 (修复版)
 # =======================================================
-def task_client_upload(client, weight):
+def task_client_train_and_project(client, global_params_cpu, proj_path, target_layers, device_str):
     """
-    单个客户端的上传任务：计算加权参数
+    Phase 1: 本地训练 & 投影
     """
     try:
+        # 1. 在子进程内重建设备对象
+        device = torch.device(device_str)
+        
+        # 2. [修复点] 初始化模型
+        # 如果 model 为 None (首次运行或多进程不共享状态)，则先实例化
+        if client.model is None:
+            client.model = client.model_class().to(device)
+        else:
+            client.model = client.model.to(device)
+        
+        # 3. 接收参数 (将 CPU 参数转到 GPU)
+        # receive_model_and_proj 内部会调用 load_state_dict
+        # 我们需要确保传入的 params 已经在目标 device 上，或者 rely on load_state_dict 的自动处理(通常需要同一 device)
+        global_params_device = {k: v.to(device) for k, v in global_params_cpu.items()}
+        
+        client.receive_model_and_proj(global_params_device, proj_path)
+        
+        # 4. 本地训练
+        _ = client.local_train()
+        
+        # 5. 生成投影
+        feature_dict = client.generate_gradient_projection(target_layers=target_layers)
+        
+        # 6. [关键] 将结果转回 CPU
+        feature_dict_cpu = {
+            'full': feature_dict['full'].cpu(),
+            'layers': {}
+        }
+        if 'layers' in feature_dict:
+            for k, v in feature_dict['layers'].items():
+                feature_dict_cpu['layers'][k] = v.cpu()
+                
+        data_size = len(client.dataloader.dataset)
+        
+        # 7. 清理显存
+        client.model.cpu() 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return client.client_id, feature_dict_cpu, data_size, None
+        
+    except Exception as e:
+        # 打印完整堆栈以便调试
+        import traceback
+        traceback.print_exc()
+        return client.client_id, None, 0, str(e)
+
+def task_client_upload(client, weight):
+    """Phase 2: 计算加权参数"""
+    try:
         if weight > 0:
+            # 在 task_client_train_and_project 结束时模型已经回到了 CPU
+            # 所以这里直接在 CPU 上操作即可
             weighted_params = client.prepare_upload_weighted_params(weight)
-            return client.client_id, weighted_params, None
+            # 确保是 CPU 张量
+            weighted_params_cpu = {k: v.cpu() for k, v in weighted_params.items()}
+            return client.client_id, weighted_params_cpu, None
         else:
             return client.client_id, None, None
     except Exception as e:
-        return client.client_id, None, e
+        return client.client_id, None, str(e)
 
 def run_single_mode(full_config, mode_name, current_mode_config):
-    # 提取参数
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     attack_conf = full_config['attack']
@@ -75,11 +166,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     
     verbose = exp_conf.get('verbose', False)
     log_interval = exp_conf.get('log_interval', 100)
-    # [新增] 获取线程数，默认为 1 (串行)
-    thread_count = exp_conf.get('thread_count', 1)
-
-    # 1. 结果存在性检查
-    exists, acc_history = check_result_exists(
+    worker_count = exp_conf.get('thread_count', 1)
+    use_multiprocessing = exp_conf.get('use_multiprocessing', False)
+    
+    # 结果检查
+    exists, data = check_result_exists(
         save_dir=exp_conf['save_dir'],
         mode_name=mode_name,
         model_type=data_conf['model'],
@@ -89,21 +180,21 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     )
     if exists:
         print(f"模式 {mode_name} 已完成，直接返回结果。")
-        return np.array(acc_history)
+        return np.array(data['accuracy_history'])
 
     device = get_device(exp_conf.get('device', 'auto'))
-    
-    # 日志文件路径
-    log_filename = get_result_filename(
-        mode_name, 
-        data_conf['model'], 
-        data_conf['dataset'], 
-        current_mode_config['defense_method'], 
-        current_mode_config
-    ).replace('.npz', '_detection_log.csv')
-    log_file_path = os.path.join(exp_conf['save_dir'], log_filename)
+    device_str = str(device)
 
-    # 2. 数据准备
+    # 日志路径
+    log_file_path = None
+    defense_name = current_mode_config['defense_method']
+    if any(k in defense_name for k in ["mesas", "projected", "layers_proj"]):
+        log_filename = get_result_filename(
+            mode_name, data_conf['model'], data_conf['dataset'], defense_name, current_mode_config
+        ).replace('.npz', '_detection_log.csv')
+        log_file_path = os.path.join(exp_conf['save_dir'], log_filename)
+
+    # 数据准备
     all_client_dataloaders, test_loader = load_and_split_dataset(
         dataset_name=data_conf['dataset'],
         num_clients=fed_conf['total_clients'],
@@ -113,7 +204,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         data_dir="./data"
     )
 
-    # 3. 初始化 Server
+    # Server 初始化
     model_class = LeNet5 if data_conf['model'] == 'lenet5' else CIFAR10Net
     init_model = model_class()
     model_param_dim = sum(p.numel() for p in init_model.parameters())
@@ -127,28 +218,21 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         log_file_path=log_file_path
     )
     
-    # 投影矩阵生成
     config_proj_dim = full_config['defense'].get('projection_dim', 1024)
     final_output_dim = min(config_proj_dim, model_param_dim)
-    print(f"  [Init] Projection Matrix: {model_param_dim} -> {final_output_dim}")
     matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}_{final_output_dim}.pt"
     server.generate_projection_matrix(model_param_dim, final_output_dim, matrix_path)
 
-    # 4. 初始化 Client
+    # Client 初始化
     poison_client_ids = []
     current_poison_ratio = current_mode_config.get('poison_ratio', 0.0)
-    
     if current_poison_ratio > 0:
-        poison_client_ids = random.sample(
-            range(fed_conf['total_clients']), 
-            int(fed_conf['total_clients'] * current_poison_ratio)
-        )
+        poison_client_ids = random.sample(range(fed_conf['total_clients']), int(fed_conf['total_clients'] * current_poison_ratio))
     
     clients = []
     active_attacks = attack_conf.get('active_attacks', [])
     attack_params_dict = attack_conf.get('params', {})
     attack_idx = 0
-
     primary_attack_type = None
     primary_attack_params = {}
 
@@ -159,64 +243,57 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             attack_idx += 1
             a_params = attack_params_dict.get(a_type, {})
             poison_loader = PoisonLoader([a_type], a_params)
-            
             if primary_attack_type is None:
                 primary_attack_type = a_type
                 primary_attack_params = a_params
-            
-            if verbose:
-                print(f"  [Init] Client {cid} set as Malicious ({a_type})")
         else:
             poison_loader = PoisonLoader([], {})
 
-        clients.append(Client(
-            cid, 
-            all_client_dataloaders[cid], 
-            model_class, 
-            poison_loader,
-            verbose=verbose,
-            log_interval=log_interval
-        ))
+        clients.append(Client(cid, all_client_dataloaders[cid], model_class, poison_loader, verbose=verbose, log_interval=log_interval))
 
-    # 5. 训练主循环
+    # 打印配置
+    print_configuration_summary(mode_name, current_mode_config, full_config)
+    print(f"  [Init] Projection Matrix: {model_param_dim} -> {final_output_dim}")
+    print("\n>>> Training Start...")
+
+    # 选择执行器
+    if worker_count <= 1:
+        use_multiprocessing = False
+    ExecutorClass = ProcessPoolExecutor if use_multiprocessing else ThreadPoolExecutor
+    
     accuracy_history = []
     asr_history = []
     total_rounds = fed_conf['comm_rounds']
     target_layers_config = full_config['defense'].get('target_layers', [])
     
-    print(f"\n>>> 开始训练: {mode_name} | 恶意比例: {current_poison_ratio} | 防御: {current_mode_config['defense_method']}")
-    print(f">>> 并行线程数: {thread_count}")
-    
     start_time = time.time()
     
-    # -------------------------------------------------------------
-    # 训练循环
-    # -------------------------------------------------------------
     for r in range(1, total_rounds + 1):
         global_params, proj_path = server.get_global_params_and_proj()
         active_ids = random.sample(range(fed_conf['total_clients']), fed_conf['active_clients'])
         
-        # 临时字典，用于存储乱序返回的结果 {cid: result}
+        # 准备传给子进程的参数 (必须是 CPU 版本)
+        if use_multiprocessing:
+            global_params_for_worker = {k: v.cpu() for k, v in global_params.items()}
+        else:
+            global_params_for_worker = global_params
+            
         round_results_buffer = {}
         
-        # =========================================================
-        # >>> Phase 1: 并行本地训练 & 投影 <<<
-        # =========================================================
-        # 使用 ThreadPoolExecutor 管理并行
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            # 提交所有任务
+        # >>> Phase 1: 并行本地训练 <<<
+        with ExecutorClass(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(
                     task_client_train_and_project, 
                     clients[cid], 
-                    global_params, 
+                    global_params_for_worker, 
                     proj_path, 
-                    target_layers_config
+                    target_layers_config,
+                    device_str
                 ): cid 
                 for cid in active_ids
             }
             
-            # 等待完成并收集结果
             for future in as_completed(futures):
                 cid, feature_dict, data_size, err = future.result()
                 if err:
@@ -224,31 +301,30 @@ def run_single_mode(full_config, mode_name, current_mode_config):
                 else:
                     round_results_buffer[cid] = (feature_dict, data_size)
         
-        # 重新整理顺序（必须与 active_ids 顺序一致传给 Server）
+        # 整理数据
         round_features = []
         round_data_sizes = []
         for cid in active_ids:
             if cid in round_results_buffer:
                 feat, size = round_results_buffer[cid]
-                round_features.append(feat)
+                # 确保特征在 Server 计算时回到 GPU
+                feat_device = {}
+                feat_device['full'] = feat['full'].to(device)
+                if 'layers' in feat:
+                    feat_device['layers'] = {k: v.to(device) for k, v in feat['layers'].items()}
+                
+                round_features.append(feat_device)
                 round_data_sizes.append(size)
             else:
-                # 理论上不应发生，除非线程崩了
-                print(f"  [Warning] Missing result from Client {cid}")
-                round_features.append({}) # 空字典占位
+                round_features.append({})
                 round_data_sizes.append(0)
 
-        # =========================================================
-        # Phase 2: 检测 & 计算权重 (Server 是中心节点，不并行)
-        # =========================================================
+        # >>> Phase 2: 检测 <<<
         weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes, current_round=r)
         
-        # =========================================================
-        # >>> Phase 3: 并行加权参数准备 (Upload) <<<
-        # =========================================================
+        # >>> Phase 3: 并行加权上传 <<<
         round_models_buffer = {}
-        
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        with ExecutorClass(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(
                     task_client_upload, 
@@ -265,22 +341,17 @@ def run_single_mode(full_config, mode_name, current_mode_config):
                 else:
                     round_models_buffer[cid] = w_params
 
-        # 整理上传模型列表 (剔除 None)
         valid_models = []
         valid_ids = []
-        
         for cid in active_ids:
-            # 只有当模型存在且非None时才聚合
             m = round_models_buffer.get(cid)
             if m is not None:
-                valid_models.append(m)
+                m_device = {k: v.to(device) for k, v in m.items()}
+                valid_models.append(m_device)
                 valid_ids.append(cid)
         
-        # =========================================================
-        # Phase 4: 全局聚合 & 评估
-        # =========================================================
+        # >>> Phase 4: 聚合 & 评估 <<<
         server.update_global_model(valid_models, valid_ids)
-        
         acc = server.evaluate(test_loader)
         accuracy_history.append(acc)
         
@@ -290,39 +361,34 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             asr_history.append(asr)
             asr_str = f" | ASR: {asr:.2f}%"
         
-        # 计算本轮耗时
         current_time = time.time()
         elapsed = current_time - start_time
         print(f"  Round {r}/{total_rounds} | Accuracy: {acc:.2f}%{asr_str} | Time: {elapsed:.1f}s")
             
-        # 清理显存
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # -------------------------------------------------------------
-    # 结束与总结
-    # -------------------------------------------------------------
+    # 结束
     end_time = time.time()
     total_time = end_time - start_time
-    
-    print("\n" + "="*50)
-    print(f"  实验总结报告 ({mode_name})")
-    print("="*50)
-    print(f"  总耗时     : {total_time:.2f} seconds ({total_time/60:.2f} mins)")
-    print(f"  最终准确率 : {accuracy_history[-1]:.2f}%")
+    print("\n" + "="*65)
+    print(f"  Experiment Report | Mode: {mode_name}")
+    print("="*65)
+    print(f"  Total Time     : {total_time:.2f} s ({total_time/60:.2f} min)")
+    print(f"  Final Accuracy : {accuracy_history[-1]:.2f}%")
     if asr_history:
-        print(f"  最终 ASR   : {asr_history[-1]:.2f}%")
+        print(f"  Final ASR      : {asr_history[-1]:.2f}%")
         
     if server.detection_history:
-        print("\n  [防御拦截统计]")
-        print(f"  {'Client ID':<10} {'Suspect Count':<15} {'Kicked Count':<15} {'Details'}")
+        print("\n  [Defense Statistics]")
+        print(f"  {'Client':<8} {'Suspect':<10} {'Kicked':<10} {'Latest Events'}")
         print("  " + "-"*60)
         for cid, stats in sorted(server.detection_history.items()):
             if stats['suspect_cnt'] > 0 or stats['kicked_cnt'] > 0:
-                events_str = ",".join(stats['events'][-5:])
-                print(f"  {cid:<10} {stats['suspect_cnt']:<15} {stats['kicked_cnt']:<15} {events_str}...")
-    print("="*50 + "\n")
+                events_str = ",".join(stats['events'][-3:])
+                print(f"  {cid:<8} {stats['suspect_cnt']:<10} {stats['kicked_cnt']:<10} {events_str}...")
+    print("="*65 + "\n")
 
     save_result_with_config(
         save_dir=exp_conf['save_dir'],
@@ -331,7 +397,8 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         dataset_type=data_conf['dataset'],
         detection_method=current_mode_config['defense_method'],
         config=current_mode_config,
-        accuracy_history=accuracy_history
+        accuracy_history=accuracy_history,
+        asr_history=asr_history
     )
     return np.array(accuracy_history)
 

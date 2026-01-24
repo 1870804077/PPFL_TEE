@@ -4,10 +4,7 @@
 experiment:
   seed: 42
   save_dir: "results"
-
   thread_count: 20
-  use_multiprocessing: true
-  
   device: "cuda"  # auto, cuda, or cpu
   modes: "all"  #pure_training poison_no_detection poison_with_detection all
   
@@ -41,7 +38,7 @@ defense:
     - "fc3.weight"
   params:
     # DBSCAN 聚类参数
-    dbscan_eps: 0.5         # 邻域半径 (Non-IID 越严重，这个值要越大)
+    dbscan_eps: 0.5          # 邻域半径 (Non-IID 越严重，这个值要越大)
     dbscan_min_samples: 2    # 最小核心点数
     
     # 统计筛除参数

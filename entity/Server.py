@@ -64,7 +64,7 @@ class Server:
         self._update_global_direction_feature(client_projections)
         weights = {}
 
-        if "mesas" in self.detection_method or "projected" in self.detection_method:
+        if "layers" in self.detection_method or "proj" in self.detection_method:
             if self.verbose:
                 print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
 
