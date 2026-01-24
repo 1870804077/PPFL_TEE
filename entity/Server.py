@@ -1,5 +1,7 @@
 import torch
 import copy
+import csv
+import os
 from collections import defaultdict
 from _utils_.LSH_proj_extra import SuperBitLSH
 from defence.score import ScoreCalculator
@@ -9,12 +11,13 @@ from defence.layers_proj_detect import Layers_Proj_Detector
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Server:
-    def __init__(self, model, detection_method="lsh_score_kickout", defense_config=None, seed=42, verbose=False):
+    def __init__(self, model, detection_method="lsh_score_kickout", defense_config=None, seed=42, verbose=False, log_file_path=None):
         self.global_model = model.to(DEVICE)
         self.superbit_lsh = SuperBitLSH(seed=seed)
         self.projection_matrix_path = None
         self.detection_method = detection_method
         self.verbose = verbose
+        self.log_file_path = log_file_path
         
         self.suspect_counters = {} 
         self.global_update_direction = None 
@@ -26,6 +29,25 @@ class Server:
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
         self.current_round_weights = {}
+
+        if self.log_file_path and "mesas" in self.detection_method:
+            self._init_log_file()
+
+    def _init_log_file(self):
+        """初始化详细日志 CSV 文件"""
+        log_dir = os.path.dirname(self.log_file_path)
+        if log_dir: os.makedirs(log_dir, exist_ok=True)
+        
+        headers = [
+            "Round", "Client_ID", 
+            "Full_L2", "L2_Median", "L2_MAD", "L2_Threshold",
+            "Full_Var", "Var_Median", "Var_MAD", "Var_Threshold",
+            "Cos_Sim", "Cluster", 
+            "Score", "Status"
+        ]
+        with open(self.log_file_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
 
     def generate_projection_matrix(self, input_dim, output_dim, matrix_file_path=None):
         if matrix_file_path is None:
@@ -39,7 +61,6 @@ class Server:
 
     def calculate_weights(self, client_id_list, client_features_dict_list, client_data_sizes, current_round=0):
         client_projections = {cid: feat for cid, feat in zip(client_id_list, client_features_dict_list)}
-
         self._update_global_direction_feature(client_projections)
         weights = {}
 
@@ -47,14 +68,18 @@ class Server:
             if self.verbose:
                 print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
 
-            # [修改] 传入 verbose=self.verbose 以触发调试打印
-            raw_weights, logs = self.mesas_detector.detect(
+            raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, 
                 self.global_update_direction, 
                 self.suspect_counters,
                 verbose=self.verbose 
             )
             
+            # 写入日志
+            if self.log_file_path:
+                self._write_detection_log(current_round, logs, raw_weights, global_stats)
+
+            # 更新历史记录
             for cid in sorted(logs.keys()):
                 status = logs[cid].get('status', 'NORMAL')
                 if "SUSPECT" in status:
@@ -78,6 +103,25 @@ class Server:
 
         self.current_round_weights = weights
         return weights
+
+    def _write_detection_log(self, round_num, logs, raw_weights, stats):
+        """将本轮检测数据写入 CSV"""
+        with open(self.log_file_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for cid in sorted(logs.keys()):
+                metrics = logs[cid]
+                row = [
+                    round_num, cid,
+                    f"{metrics.get('full_l2', 0):.4f}", 
+                    f"{stats['l2_median']:.4f}", f"{stats['l2_mad']:.4f}", f"{stats['l2_threshold']:.4f}",
+                    f"{metrics.get('full_var', 0):.4f}", 
+                    f"{stats['var_median']:.4f}", f"{stats['var_mad']:.4f}", f"{stats['var_threshold']:.4f}",
+                    f"{metrics.get('full_hist_cos', 0):.4f}",
+                    metrics.get('full_cluster', 0),
+                    f"{raw_weights.get(cid, 0):.2f}",
+                    metrics.get('status', 'UNKNOWN')
+                ]
+                writer.writerow(row)
 
     def _update_global_direction_feature(self, client_projections):
         if not client_projections: return
@@ -152,7 +196,6 @@ class Server:
         return 100 * correct_attack / total_attack
 
     def _fallback_old_detection(self, ids, features, sizes):
-        # ... (保持不变) ...
         if not self.score_calculator and not self.kickout_manager:
             total_size = sum(sizes)
             if total_size > 0:

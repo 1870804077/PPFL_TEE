@@ -15,7 +15,7 @@ from model.Lenet5 import LeNet5
 from model.Cifar10Net import CIFAR10Net
 from _utils_.poison_loader import PoisonLoader
 from _utils_.dataloader import load_and_split_dataset
-from _utils_.save_config import check_result_exists, save_result_with_config, plot_comparison_curves
+from _utils_.save_config import check_result_exists, save_result_with_config, plot_comparison_curves, get_result_filename
 from entity.Server import Server
 from entity.Client import Client
 
@@ -25,16 +25,13 @@ def get_device(config_device):
     return torch.device(config_device)
 
 def run_single_mode(full_config, mode_name, current_mode_config):
-    # 提取常用参数
+    # ... (参数提取保持不变) ...
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     attack_conf = full_config['attack']
-    
-    # 提取日志配置
     verbose = full_config['experiment'].get('verbose', False)
     log_interval = full_config['experiment'].get('log_interval', 100)
 
-    # 1. 结果存在性检查
     exists, acc_history = check_result_exists(
         save_dir=full_config['experiment']['save_dir'],
         mode_name=mode_name,
@@ -48,6 +45,20 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         return np.array(acc_history)
 
     device = get_device(full_config['experiment'].get('device', 'auto'))
+    
+    #  生成 CSV 日志文件路径
+    # 使用与结果文件相同的命名规则，但后缀改为 .csv
+    log_filename = get_result_filename(
+        mode_name, 
+        data_conf['model'], 
+        data_conf['dataset'], 
+        current_mode_config['defense_method'], 
+        current_mode_config
+    ).replace('.npz', '_detection_log.csv')
+    
+    log_file_path = os.path.join(full_config['experiment']['save_dir'], log_filename)
+    if verbose:
+        print(f"日志文件将保存至: {log_file_path}")
 
     # 2. 数据准备
     all_client_dataloaders, test_loader = load_and_split_dataset(
@@ -59,17 +70,18 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         data_dir="./data"
     )
 
-    # 3. 初始化 Server
     model_class = LeNet5 if data_conf['model'] == 'lenet5' else CIFAR10Net
     init_model = model_class()
     model_param_dim = sum(p.numel() for p in init_model.parameters())
     
+    # 传递 log_file_path
     server = Server(
         init_model, 
         detection_method=current_mode_config['defense_method'], 
         defense_config=full_config['defense'],
         seed=full_config['experiment']['seed'],
         verbose=verbose,
+        log_file_path=log_file_path  
     )
     
     matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}.pt"
@@ -90,7 +102,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     attack_params_dict = attack_conf.get('params', {})
     attack_idx = 0
 
-    # 记录实际使用的攻击配置用于ASR检测
     primary_attack_type = None
     primary_attack_params = {}
 
@@ -138,7 +149,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         round_data_sizes = []
         round_weighted_models = []
         
-        # Phase 1: 本地训练 & 投影
         for cid in active_ids:
             client = clients[cid]
             client.receive_model_and_proj(global_params, proj_path)
@@ -147,7 +157,6 @@ def run_single_mode(full_config, mode_name, current_mode_config):
             round_features.append(feature_dict)
             round_data_sizes.append(len(client.dataloader.dataset))
         
-        # Phase 2: 检测 & 聚合
         weights_map = server.calculate_weights(active_ids, round_features, round_data_sizes, current_round=r)
         
         for cid in active_ids:
@@ -164,11 +173,9 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         
         server.update_global_model(valid_models, valid_ids)
         
-        # 评估
         acc = server.evaluate(test_loader)
         accuracy_history.append(acc)
         
-        # ASR 评估
         asr_str = ""
         if current_poison_ratio > 0 and primary_attack_type in ["label_flip", "backdoor"]:
             asr = server.evaluate_asr(test_loader, primary_attack_type, primary_attack_params)
@@ -219,13 +226,12 @@ def load_config(config_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='../config/config.yaml')
+    parser.add_argument('--config', type=str, default='config/config.yaml')
     parser.add_argument('--mode', type=str, default=None, help='指定只运行某个模式(逗号分隔)')
     args = parser.parse_args()
     
     config = load_config(args.config)
     
-    # [修改点] 补充 model_type 和 dataset_type，确保绘图时能匹配到文件
     base_flat_config = {
         'total_clients': config['federated']['total_clients'],
         'batch_size': config['federated']['batch_size'],
@@ -234,8 +240,8 @@ def main():
         'alpha': config['data']['alpha'],
         'attack_types': config['attack']['active_attacks'],
         'seed': config['experiment']['seed'],
-        'model_type': config['data']['model'],      # 新增
-        'dataset_type': config['data']['dataset']   # 新增
+        'model_type': config['data']['model'],
+        'dataset_type': config['data']['dataset']
     }
     
     default_poison_ratio = config['attack']['poison_ratio']

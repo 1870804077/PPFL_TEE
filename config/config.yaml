@@ -5,7 +5,7 @@ experiment:
   seed: 42
   save_dir: "results"
   device: "cuda"  # auto, cuda, or cpu
-  modes: "poison_no_detection"  #pure_training poison_no_detection poison_with_detection all
+  modes: "poison_with_detection"  #pure_training poison_no_detection poison_with_detection all
   verbose: true        # 是否开启详细日志
   log_interval: 100   # 训练时每隔多少个 batch 打印一次进度
 
@@ -45,8 +45,8 @@ defense:
     dbscan_min_samples: 2    # 最小核心点数
     
     # 统计筛除参数
-    l2_threshold_multiplier: 3.0  # L2范数阈值倍数 (Median + k * MAD)
-    var_threshold_multiplier: 3.0 # 方差阈值倍数
+    l2_threshold_multiplier: 2.5  # L2范数阈值倍数 (Median + k * MAD)
+    var_threshold_multiplier: 2.5 # 方差阈值倍数
     
     # 评分参数
     base_good_score: 10.0    # 良性基础分
