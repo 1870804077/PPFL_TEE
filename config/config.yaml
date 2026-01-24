@@ -28,17 +28,10 @@ data:
 # ================= 防御策略 =================
 defense:
   method: "layers_proj_detect" # none, lsh_score_kickout, only_score, only_kickout, layers_proj_detect
+  projection_dim: 1024
   target_layers: 
     - "conv1.weight"
     - "fc3.weight"
-
-defense:
-  method: "projected_mesas"
-  
-  target_layers: 
-    - "conv1.weight"
-    - "fc3.weight"
-
   params:
     # DBSCAN 聚类参数
     dbscan_eps: 0.35          # 邻域半径 (Non-IID 越严重，这个值要越大)

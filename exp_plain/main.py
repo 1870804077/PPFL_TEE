@@ -25,7 +25,6 @@ def get_device(config_device):
     return torch.device(config_device)
 
 def run_single_mode(full_config, mode_name, current_mode_config):
-    # ... (参数提取保持不变) ...
     fed_conf = full_config['federated']
     data_conf = full_config['data']
     attack_conf = full_config['attack']
@@ -74,7 +73,7 @@ def run_single_mode(full_config, mode_name, current_mode_config):
     init_model = model_class()
     model_param_dim = sum(p.numel() for p in init_model.parameters())
     
-    # 传递 log_file_path
+    # 传递 log_file_path，初始化Server
     server = Server(
         init_model, 
         detection_method=current_mode_config['defense_method'], 
@@ -84,8 +83,11 @@ def run_single_mode(full_config, mode_name, current_mode_config):
         log_file_path=log_file_path  
     )
     
-    matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}.pt"
-    server.generate_projection_matrix(model_param_dim, min(1024, model_param_dim), matrix_path)
+    config_proj_dim = full_config['defense'].get('projection_dim', 1024)
+    final_output_dim = min(config_proj_dim, model_param_dim)
+    print(f"  [Init] Projection Matrix: {model_param_dim} -> {final_output_dim}")
+    matrix_path = f"proj/projection_matrix_{data_conf['dataset']}_{data_conf['model']}_{final_output_dim}.pt"
+    server.generate_projection_matrix(model_param_dim, final_output_dim, matrix_path)
 
     # 4. 初始化 Client
     poison_client_ids = []
