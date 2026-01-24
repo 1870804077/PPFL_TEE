@@ -4,10 +4,14 @@
 experiment:
   seed: 42
   save_dir: "results"
+  thread_count: 5
   device: "cuda"  # auto, cuda, or cpu
   modes: "poison_with_detection"  #pure_training poison_no_detection poison_with_detection all
+  
+  
   verbose: true        # 是否开启详细日志
   log_interval: 100   # 训练时每隔多少个 batch 打印一次进度
+  
 
 # ================= 联邦学习参数 =================
 federated:
