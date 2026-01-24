@@ -1,0 +1,15 @@
+{
+    "total_clients": 20,
+    "batch_size": 64,
+    "comm_rounds": 10,
+    "if_noniid": false,
+    "alpha": 0.5,
+    "attack_types": [
+        "backdoor"
+    ],
+    "seed": 42,
+    "model_type": "lenet5",
+    "dataset_type": "mnist",
+    "poison_ratio": 0.0,
+    "defense_method": "none"
+}

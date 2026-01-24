@@ -6,7 +6,7 @@ experiment:
   save_dir: "results"
   thread_count: 5
   device: "cuda"  # auto, cuda, or cpu
-  modes: "poison_with_detection"  #pure_training poison_no_detection poison_with_detection all
+  modes: "all"  #pure_training poison_no_detection poison_with_detection all
   
   
   verbose: true        # 是否开启详细日志
@@ -56,7 +56,7 @@ attack:
   poison_ratio: 0.2
   # 启用的攻击类型列表 (可多选)
   active_attacks: 
-    - "label_flip"
+    - "backdoor"
   
   # 具体攻击参数 
   params:

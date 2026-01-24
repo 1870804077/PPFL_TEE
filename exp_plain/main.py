@@ -341,7 +341,7 @@ def load_config(config_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='config/config.yaml')
+    parser.add_argument('--config', type=str, default='../config/config.yaml')
     parser.add_argument('--mode', type=str, default=None, help='指定只运行某个模式(逗号分隔)')
     args = parser.parse_args()
     
