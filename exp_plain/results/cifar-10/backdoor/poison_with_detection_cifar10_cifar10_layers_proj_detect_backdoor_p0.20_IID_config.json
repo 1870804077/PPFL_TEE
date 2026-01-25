@@ -1,0 +1,15 @@
+{
+    "total_clients": 20,
+    "batch_size": 64,
+    "comm_rounds": 10,
+    "if_noniid": false,
+    "alpha": 0.5,
+    "attack_types": [
+        "backdoor"
+    ],
+    "seed": 42,
+    "model_type": "cifar10",
+    "dataset_type": "cifar10",
+    "poison_ratio": 0.2,
+    "defense_method": "layers_proj_detect"
+}

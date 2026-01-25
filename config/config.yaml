@@ -64,7 +64,7 @@ attack:
   poison_ratio: 0.2
   # 启用的攻击类型列表 (可多选)
   active_attacks: 
-    - "random_poison"
+    - "backdoor"
   
   # 具体攻击参数 
   params:

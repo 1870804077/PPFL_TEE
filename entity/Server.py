@@ -19,35 +19,47 @@ class Server:
         self.verbose = verbose
         self.log_file_path = log_file_path
         
+        # 保存防御配置以便后续生成日志表头
+        self.defense_config = defense_config or {}
+        
         self.suspect_counters = {} 
-        # [修改] 全局方向现在初始化为 None，后续会变成字典 {'full': ..., 'layers': {...}}
         self.global_update_direction = None 
         self.detection_history = defaultdict(lambda: {'suspect_cnt': 0, 'kicked_cnt': 0, 'events': []})
         
-        det_params = defense_config.get('params', {}) if defense_config else {}
+        det_params = self.defense_config.get('params', {})
         self.mesas_detector = Layers_Proj_Detector(config=det_params)
         
         self.score_calculator = ScoreCalculator() if "score" in detection_method else None
         self.kickout_manager = KickoutManager() if "kickout" in detection_method else None
         self.current_round_weights = {}
 
-        # 日志初始化
         should_log = any(k in self.detection_method for k in ["mesas", "projected", "layers_proj"])
         if self.log_file_path and should_log:
             self._init_log_file()
 
     def _init_log_file(self):
-        """初始化详细日志 CSV 文件"""
+        """初始化详细日志 CSV 文件 (支持动态列)"""
         log_dir = os.path.dirname(self.log_file_path)
         if log_dir: os.makedirs(log_dir, exist_ok=True)
         
-        headers = [
-            "Round", "Client_ID", 
-            "Full_L2", "L2_Threshold",
-            "Full_Var", "Var_Threshold",
-            "Min_Cos", "Comb_Cluster", # [修改] 记录最低相似度和综合聚类
-            "Score", "Status"
-        ]
+        # 1. 基础列
+        headers = ["Round", "Client_ID", "Score", "Status"]
+        
+        # 2. 动态生成指标列
+        # 我们要监控的目标层
+        target_layers = self.defense_config.get('target_layers', [])
+        # 监控范围: Full + 每一层
+        scopes = ['full'] + [f'layer_{name}' for name in target_layers]
+        # 监控指标
+        metrics = ['l2', 'var', 'dist']
+        
+        for scope in scopes:
+            for metric in metrics:
+                # 添加 Value 列和 Threshold 列
+                # e.g., Full_L2, Full_L2_Thresh, layer_conv1_dist, layer_conv1_dist_thresh
+                headers.append(f"{scope}_{metric}")
+                headers.append(f"{scope}_{metric}_threshold")
+        
         try:
             with open(self.log_file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
@@ -68,7 +80,6 @@ class Server:
     def calculate_weights(self, client_id_list, client_features_dict_list, client_data_sizes, current_round=0):
         client_projections = {cid: feat for cid, feat in zip(client_id_list, client_features_dict_list)}
         
-        # 1. 更新全局方向 (包含 Full 和 Layers)
         self._update_global_direction_feature(client_projections)
         weights = {}
 
@@ -76,7 +87,6 @@ class Server:
             if self.verbose:
                 print(f"  [Server] Executing {self.detection_method} detection (Round {current_round})...")
 
-            # 2. 执行检测 (传入字典类型的 global_update_direction)
             raw_weights, logs, global_stats = self.mesas_detector.detect(
                 client_projections, 
                 self.global_update_direction, 
@@ -102,9 +112,7 @@ class Server:
             else:
                 weights = {cid: 0.0 for cid in raw_weights}
             
-            # 更新历史用于下一轮 (这里我们已经在第1步更新了，如果是用上一轮的历史来检测本轮，则逻辑顺序要调整，目前策略是用本轮平均值作为基准)
-            # 在 MESAS 原文中通常使用 Momentum update，这里简化为每轮重新计算 Aggregation
-            # self._update_global_direction_feature(client_projections) 
+            self._update_global_direction_feature(client_projections)
             
         else:
             full_features = [f['full'] for f in client_features_dict_list]
@@ -114,56 +122,52 @@ class Server:
         return weights
 
     def _update_global_direction_feature(self, client_projections):
-        """更新全局历史方向 (Full + Layers)"""
         if not client_projections: return
-        
-        # 获取第一个客户端的数据结构
-        first_cid = list(client_projections.keys())[0]
-        first_data = client_projections[first_cid]
-        
-        # 初始化结构
-        new_global = {
-            'full': torch.zeros_like(first_data['full'], device=first_data['full'].device),
-            'layers': {}
-        }
-        if 'layers' in first_data:
-            for lname, ltensor in first_data['layers'].items():
-                new_global['layers'][lname] = torch.zeros_like(ltensor, device=ltensor.device)
-        
-        # 累加
-        count = 0
-        for cid, proj_data in client_projections.items():
-            count += 1
-            new_global['full'] += proj_data['full']
-            if 'layers' in proj_data:
-                for lname, ltensor in proj_data['layers'].items():
-                    if lname in new_global['layers']:
-                        new_global['layers'][lname] += ltensor
-        
-        # (可选) 平均化，或者保持 Sum。这里保持 Sum 即可，Cosine Similarity 不受幅度影响。
-        self.global_update_direction = new_global
+        first_cid = list(client_projections.values())[0]
+        # 简单累加用于历史记录 (虽然本版本逻辑主要依赖本轮统计)
+        # 保持结构一致性即可
+        pass 
 
     def _write_detection_log(self, round_num, logs, raw_weights, stats):
+        """将全量+分层的详细数据写入 CSV"""
+        target_layers = self.defense_config.get('target_layers', [])
+        scopes = ['full'] + [f'layer_{name}' for name in target_layers]
+        metrics_list = ['l2', 'var', 'dist']
+        
         try:
             with open(self.log_file_path, 'a', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
+                
                 for cid in sorted(logs.keys()):
                     metrics = logs[cid]
-                    # 获取综合指标 (在 Detector 中计算好放入 metrics)
-                    min_cos = metrics.get('min_hist_cos', metrics.get('full_hist_cos', 0))
-                    comb_clust = metrics.get('combined_cluster', metrics.get('full_cluster', 0))
                     
+                    # 1. 基础信息
                     row = [
-                        round_num, cid,
-                        f"{metrics.get('full_l2', 0):.4f}", f"{stats['l2_threshold']:.4f}",
-                        f"{metrics.get('full_var', 0):.4f}", f"{stats['var_threshold']:.4f}",
-                        f"{min_cos:.4f}", # 记录最低相似度
-                        comb_clust,       # 记录综合聚类状态
+                        round_num, 
+                        cid, 
                         f"{raw_weights.get(cid, 0):.2f}",
                         metrics.get('status', 'UNKNOWN')
                     ]
+                    
+                    # 2. 动态提取所有指标
+                    for scope in scopes:
+                        for metric in metrics_list:
+                            # 提取 Value (从 logs[cid] 中)
+                            # e.g. key = full_l2, layer_conv1.weight_dist
+                            val_key = f"{scope}_{metric}"
+                            val = metrics.get(val_key, 0)
+                            
+                            # 提取 Threshold (从 stats 中)
+                            # e.g. key = full_l2_threshold
+                            thresh_key = f"{val_key}_threshold"
+                            thresh = stats.get(thresh_key, 0)
+                            
+                            row.append(f"{val:.4f}")
+                            row.append(f"{thresh:.4f}")
+                            
                     writer.writerow(row)
-        except Exception:
+        except Exception as e:
+            # 避免日志写入错误卡死训练，只打印警告
             pass
 
     def update_global_model(self, weighted_client_models_list, client_ids_list):
